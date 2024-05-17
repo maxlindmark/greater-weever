@@ -268,7 +268,7 @@ Select a few years and plot quarters next to each other
 ```{r}
 plot_map_fc +
   geom_raster(data = pred %>%
-                filter(year %in% c(1993, 2001, 2000)),
+                filter(year %in% c(1993, 2001, 2020)),
               aes(X*1000, Y*1000, fill = est)) +
   scale_fill_viridis(name = "Density (kg/km2)", trans = "sqrt") +
   facet_grid(quarter~year) +
@@ -293,7 +293,7 @@ Here we rather arbitrarily chose a threshold of 50% to mean presence. A higher v
 #| warning: false
 #| message: false
 
-# Here simply defined as grids with >20% probability of ocurrence
+# Here simply defined as grids with >50% probability of occurrence
 n_cells <- pred %>% filter(quarter == 1) %>% nrow()
 
 pred %>% 
@@ -305,7 +305,7 @@ pred %>%
   scale_fill_brewer(palette = "Set1") +
   scale_color_brewer(palette = "Set1") +
   labs(color = "Quarter", fill = "Quarter", x = "Year",
-       y = "% of cells with probability of occurence > 20%") +
+       y = "% of cells with probability of occurence > 50%") +
   geom_smooth(method = "gam", formula = y~s(x, k = 20)) + 
   theme(legend.position = "bottom")
 ```
