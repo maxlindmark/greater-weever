@@ -39,9 +39,11 @@ for(fun in list.files(paste0(home, "/R/functions"))){
 }
 ```
 
+
 ## Read and prepare data
 
 Read data & scale variables. Note we have convert data from catch per hour to catch per area in this [script](https://github.com/maxlindmark/greater-weever/blob/main/R/prepare-data/00-prep-data.qmd), to make better use of the `get_index` function in sdmTMB. Temperature data come from [GLOBAL_MULTIYEAR_PHY_001_030]( https://data.marine.copernicus.eu/product/GLOBAL_MULTIYEAR_PHY_001_030/download?dataset=cmems_mod_glo_phy_my_0.083deg_P1M-m_202311)
+
 
 ```{r data}
 #| message: false
@@ -65,7 +67,9 @@ pred_grid <- readr::read_csv(paste0(home, "/data/clean/pred_grid.csv")) %>%
          year_f = as.factor(year))
 ```
 
+
 Fit models. Initial exploration suggest a delta_gamma model yields better residuals than a Tweedie or a [Poisson-link delta gamma](https://pbs-assess.github.io/sdmTMB/articles/web_only/poisson-link.html).
+
 
 ```{r}
 #| message: false
@@ -82,7 +86,9 @@ ggplot() +
   labs(x = "Easting (km)", y = "Northing (km)")
 ```
 
+
 We can compare a model with a spatial random effect and one with a spatiotemporal + spatial. Spatiotemporal is IID (for speed).
+
 
 ```{r}
 # Basic model
@@ -100,7 +106,9 @@ m0 <- sdmTMB(
 sanity(m0)
 ```
 
+
 Inital exploration suggests the spatiotemporal random field for the bionomial model is estimated very small, hence it's omitted here and only applies to the gamma component.
+
 
 ```{r}
 # Spatiotemporal instead?
@@ -119,13 +127,17 @@ toc()
 sanity(m1)
 ```
 
+
 AIC favours the spatiotemporal model
+
 
 ```{r}
 AIC(m0, m1)
 ```
 
+
 Check model fit. The spatiotemporal model also yields better QQ plots
+
 
 ```{r}
 #| message: false
@@ -144,8 +156,10 @@ d %>%
   theme(aspect.ratio = 1)
 ```
 
+
 ## Conditional effects
 Initial exploration also suggests that depth should be modelled on the log scale. A smooth effect works nicely for the binomial part, but it can be questioned whether depth affects the biomass density at all. However, currently in delta models in sdmTMB, if using smoothers, the effect needs to shared among model components. We could circumvent this by providing different formulas in a list, say e.g., as linear and quadratic effect. But this works ok for now. It's just a very uncertain effect. The temperature effects are very strong and very linear!
+
 
 ```{r}
 #| message: false
@@ -172,7 +186,9 @@ p3 / p4 +
   plot_layout(axes = "collect")
 ```
 
+
 ## Spatial predictions
+
 
 ```{r}
 #| message: false
@@ -214,7 +230,9 @@ p2 <- plot_map +
 p1 + p2
 ```
 
+
 ## Spatiotemporal predictions
+
 
 ```{r}
 #| fig-height: 10
@@ -263,7 +281,9 @@ plot_map_fc +
   labs(subtitle = "Quarter 3")
 ```
 
+
 Select a few years and plot quarters next to each other
+
 
 ```{r}
 plot_map_fc +
@@ -286,8 +306,10 @@ plot_map_fc +
   geom_sf()
 ```
 
+
 ## Plot area occupied over time
 Here we rather arbitrarily chose a threshold of 50% to mean presence. A higher value yields too many years with no predictions for Q1. We predict this from the binomial component of the model. Note that the increase is very steep in Q3, which also has warmed more.
+
 
 ```{r}
 #| warning: false
@@ -310,7 +332,9 @@ pred %>%
   theme(legend.position = "bottom")
 ```
 
+
 ### Get index over time
+
 
 ```{r}
 #| warning: false
@@ -348,7 +372,9 @@ ggplot(index, aes(year, est/1000, color = quarter, fill = quarter)) +
          fill = "Quarter", x = "Year", y = "Biomass estimate (tonnes)")
 ```
 
+
 ## What are the temperature trends over time? And how do they relate to the index?
+
 
 ```{r}
 #| message: false
@@ -382,7 +408,9 @@ index_temp %>%
   facet_wrap(~quarter, scales = "free")
 ```
 
+
 Calculate z-scores and plot over time
+
 
 ```{r}
 #| message: false
@@ -400,3 +428,4 @@ index_temp %>%
   facet_wrap(~quarter, scales = "free", ncol = 1) + 
   theme(legend.position = "bottom")
 ```
+
