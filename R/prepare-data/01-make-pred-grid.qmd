@@ -1,0 +1,203 @@
+---
+title: "Make the prediction grid"
+author: "Max Lindmark & Francesca Vitale"
+date: today
+date-format: iso
+toc: true
+format: 
+  html:
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 100%
+editor: source
+---
+
+## Intro
+Make an evenly spaced UTM prediction grid with all spatially varying covariates for the diet and the biomass data
+
+```{r lib}
+#| message: false
+
+library(tidyverse)
+library(tidylog)
+library(tidync)
+library(tidyterra)
+library(sp)
+library(devtools)
+library(RCurl)
+library(sdmTMB)
+library(ncdf4)
+library(terra)
+library(viridis)
+library(marmap)
+library(crayon)
+# devtools::install_github("seananderson/ggsidekick") # not on CRAN 
+library(ggsidekick)
+theme_set(theme_sleek())
+
+home <- here::here()
+
+for(fun in list.files(paste0(home, "/R/functions"))){
+  source(paste(home, "R/functions", fun, sep = "/"))
+}
+```
+
+Read data
+
+```{r data}
+# Read data
+d <- readr::read_csv(paste0(home, "/data/clean/trawl.csv"))
+```
+
+## Make the grid
+First make a grid for the area, then subset that based on the extend of the size data
+
+```{r make pred grid}
+x <- d$X
+y <- d$Y
+z <- chull(x, y)
+
+coords <- cbind(x[z], y[z])
+
+coords <- rbind(coords, coords[1, ])
+
+plot(coords[, 1] ~ coords[, 2]) # plot data
+
+sp_poly <- sp::SpatialPolygons(
+  list(sp::Polygons(list(sp::Polygon(coords)), ID = 1))
+  )
+
+sp_poly_df <- sp::SpatialPolygonsDataFrame(sp_poly,
+                                           data = data.frame(ID = 1)
+                                           )
+cell_width <- 3
+
+pred_grid <- expand.grid(
+  X = seq(min(d$X), max(d$X), cell_width),
+  Y = seq(min(d$Y), max(d$Y), cell_width),
+  year = seq(min(d$year), max(d$year)),
+  quarter = c(1, 3)
+  )
+
+ggplot(pred_grid %>% filter(year == 2019), aes(X, Y)) +
+  geom_point(size = 0.1) +
+  theme_void() +
+  coord_sf()
+
+sp::coordinates(pred_grid) <- c("X", "Y")
+
+inside <- !is.na(sp::over(pred_grid, as(sp_poly_df, "SpatialPolygons")))
+
+pred_grid <- pred_grid[inside, ]
+
+pred_grid <- as.data.frame(pred_grid)
+
+plot_map +
+  geom_point(data = filter(pred_grid, year == 1999), aes(X*1000, Y*1000), size = 0.001, alpha = 0.5) +
+  NULL
+
+# Add lat and lon
+# Need to go from UTM to lat long for this one...
+# https://stackoverflow.com/questions/30018098/how-to-convert-utm-coordinates-to-lat-and-long-in-r
+xy <- as.matrix(pred_grid %>% dplyr::select(X, Y) %>% mutate(X = X*1000, Y = Y*1000))
+v <- terra::vect(xy, crs="+proj=utm +zone=32 +datum=WGS84  +units=m")
+y <- project(v, "+proj=longlat +datum=WGS84")
+lonlat <- geom(y)[, c("x", "y")]
+
+pred_grid$lon <- lonlat[, 1]
+pred_grid$lat <- lonlat[, 2]
+```
+
+### Depth and crop
+
+```{r}
+## Generate a depth box containing the bathymetries. 
+depth_box <- getNOAA.bathy(min(d$lon) - .1, max(d$lon) + .1, min(d$lat)  - .1, max(d$lat) + .1)
+
+pred_grid$depth <- get.depth(depth_box, x = pred_grid$lon, y = pred_grid$lat, locator = F)$depth
+
+## Convert to strictly positive values. 
+pred_grid$depth <- pred_grid$depth*(-1)
+
+plot_map +
+  geom_raster(data = pred_grid,
+               aes(X*1000, Y*1000, fill = depth)) + 
+  geom_sf()
+
+# Remove Denmanrk... 
+pred_grid <- pred_grid %>% 
+  mutate(keep = ifelse(lat < 57.103 & lon < 10.28, "N", "Y")) %>% 
+  filter(keep == "Y") %>% 
+  dplyr:::select(-keep)
+
+plot_map +
+  geom_raster(data = pred_grid,
+               aes(X*1000, Y*1000, fill = depth)) + 
+  geom_sf() 
+```
+
+## Add in dynamic covariates
+Add temperature
+
+```{r}
+covPath <- paste0(home, "/data/covariates")
+
+# Source: https://data.marine.copernicus.eu/product/GLOBAL_MULTIYEAR_PHY_001_030/download?dataset=cmems_mod_glo_phy_my_0.083deg_P1M-m_202311
+# Print details
+print(nc_open(paste(covPath, "sst", "cmems_mod_glo_phy_my_0.083deg_P1M-m_1715939377383.nc", sep = "/")))
+
+temp_tibble <- tidync(paste(covPath, "sst",
+                            "cmems_mod_glo_phy_my_0.083deg_P1M-m_1715939377383.nc", sep = "/")) %>%
+  hyper_tibble() %>% 
+  mutate(date = as_datetime(time, origin = '1970-01-01')) %>%
+  mutate(month = month(date),
+         day = day(date),
+         year = year(date),
+         quarter = ifelse(month %in% c(1:3), 1, NA),
+         quarter = ifelse(month %in% c(7:9), 3, quarter)) %>% 
+  filter(quarter %in% c(1, 3)) %>% 
+  mutate(year_q = paste(year, quarter, sep = "_"))
+
+# Loop through all year combos, extract the temperatures at the data locations
+temp_list <- list()
+
+pred_grid <- pred_grid %>% 
+  mutate(year_q = paste(year, quarter, sep = "_")) %>% 
+  filter(year_q %in% temp_tibble$year_q)
+
+for(i in unique(pred_grid$year_q)) {
+  
+  d_sub <- filter(pred_grid, year_q == i)
+  temp_tibble_sub <- filter(temp_tibble, year_q == i)
+  
+  # Convert to raster
+  temp_raster <- as_spatraster(temp_tibble_sub, xycols = 2:3,
+                               crs = "WGS84", digits = 2)
+
+  ggplot() +
+    geom_spatraster(data = temp_raster$bottomT, aes(fill = bottomT)) + 
+    scale_fill_viridis(option = "magma") +
+    ggtitle(i)
+
+  # Extract from raster
+  d_sub$temp <- terra::extract(temp_raster$bottomT,
+                               d_sub %>% dplyr::select(lon, lat))$bottomT  
+    
+  # Save
+  temp_list[[i]] <- d_sub
+  
+}
+
+pred_grid <- bind_rows(temp_list)
+
+pred_grid <- pred_grid %>% drop_na(temp)
+```
+
+## Save
+
+```{r save}
+write_csv(pred_grid, file = paste0(home, "/data/clean/pred_grid.csv"))
+```

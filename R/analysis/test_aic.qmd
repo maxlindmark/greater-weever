@@ -1,0 +1,119 @@
+---
+title: "Fit models"
+author: "Max Lindmark & Francesca Vitale"
+date: today
+date-format: iso
+toc: true
+format: 
+  html:
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 100%
+editor: source
+---
+
+```{r load libraries}
+#| message: false
+#| warning: false
+
+# Load libraries
+library(tidyverse)
+library(tidylog)
+library(sdmTMB)
+library(patchwork)
+library(viridis)
+library(RColorBrewer)
+library(modelr)
+library(ggeffects)
+library(ggsidekick); theme_set(theme_sleek())
+
+home <- here::here()
+
+# Load all custom functions in R/function
+
+for(fun in list.files(paste0(home, "/R/functions"))){
+  source(paste(home, "R/functions", fun, sep = "/"))
+}
+```
+
+## Read and prepare data
+
+Read data & scale variables
+
+```{r data}
+# Read data
+d <- readr::read_csv(paste0(home, "/data/clean/trawl.csv")) %>% 
+  filter(depth > 0) %>% 
+  mutate(temp_sc = as.numeric(scale(temp)),
+         depth = log(depth), 
+         depth_sc = as.numeric(scale(depth)),
+         depth_sq = depth_sc*depth_sc,
+         quarter_f = as.factor(quarter),
+         year_f = as.factor(year))
+
+# Read prediction grid
+pred_grid <- readr::read_csv(paste0(home, "/data/clean/pred_grid.csv")) %>% 
+  filter(depth > 0) %>% 
+  mutate(temp_sc = as.numeric(scale(temp)),
+         depth = log(depth),
+         depth_sc = (depth - mean(d$depth)) / sd(d$depth),
+         depth_sq = depth_sc*depth_sc,
+         quarter_f = as.factor(quarter),
+         year_f = as.factor(year))
+```
+
+Fit models
+
+```{r}
+mesh <- make_mesh(d,
+                  xy_cols = c("X", "Y"),
+                  cutoff = 4)
+    
+ggplot() +
+  inlabru::gg(mesh$mesh) +
+  coord_fixed() +
+  geom_point(aes(X, Y), data = d, alpha = 0.2, size = 0.5) +
+  annotate("text", -Inf, Inf, label = paste("n knots = ", mesh$mesh$n), hjust = -0.1, vjust = 2) + 
+  labs(x = "Easting (km)", y = "Northing (km)")
+
+# Basic model
+m0 <- sdmTMB(
+  formula = density ~ year_f + s(depth_sc) + quarter_f + temp_sc,
+  # formula = list(density ~ year_f + s(depth_sc) + quarter_f + temp_sc,
+  #                density ~ year_f + quarter_f + temp_sc),
+  data = d,
+  mesh = mesh,
+  family = delta_gamma(),
+  spatiotemporal = "off",
+  spatial = "on",
+  time = "year")
+
+sanity(m0)
+
+res1 <- residuals(m0, model = 1)
+res2 <- residuals(m0, model = 2)
+
+qqnorm(res1); qqline(res1)
+qqnorm(res2); qqline(res2)
+
+
+# Spatiotemporal instead?
+library(tictoc)
+tic()
+m1 <- sdmTMB(
+  formula = density ~ year_f + s(depth_sc) + quarter_f + temp_sc,
+  # formula = list(density ~ year_f + s(depth_sc) + quarter_f + temp_sc,
+  #                density ~ year_f + quarter_f + temp_sc),
+  data = d,
+  mesh = mesh,
+  family = delta_gamma(),
+  spatiotemporal = "ar1",
+  spatial = "on",
+  time = "year")
+toc()
+
+AIC(m0, m1)
+```

@@ -1,0 +1,142 @@
+---
+title: "Prepare data models"
+author: "Max Lindmark & Francesca Vitale"
+date: today
+date-format: iso
+toc: true
+format: 
+  html:
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 100%
+editor: source
+---
+
+```{r load libraries}
+#| message: false
+#| warning: false
+
+# Load libraries
+library(tidyverse)
+library(tidylog)
+library(sdmTMB)
+library(patchwork)
+library(viridis)
+library(RColorBrewer)
+library(modelr)
+library(ggstats)
+library(ggspatial)
+library(marmap)
+library(ncdf4)
+library(crayon)
+library(tidyterra)
+library(tidync)
+library(ggsidekick); theme_set(theme_sleek())
+
+home <- here::here()
+
+# Load all custom functions in R/function
+# - map-plot [source_url("https://raw.githubusercontent.com/maxlindmark/cod-interactions/main/R/functions/map-plot.R")]
+# - callCopernicusCovariate
+# - extractCovariateAtLocation
+for(fun in list.files(paste0(home, "/R/functions"))){
+  source(paste(home, "R/functions", fun, sep = "/"))
+}
+```
+
+## Read and prepare data
+
+```{r}
+d <- read.csv(paste0(home, "/data/Trawl Surveys Zincl (L).csv"), sep = ";", dec = ",") %>% 
+  janitor::clean_names() %>% 
+  filter(subdiv <= 21) %>% 
+  filter(validity == "V") %>% 
+  mutate(haul_id = paste(year, quarter, month, haul)) %>% 
+  mutate(median_swept = median(swept_area, na.rm = TRUE), .by = year) %>%
+  mutate(swept_area = ifelse(is.na(swept_area), median_swept, swept_area),
+         kg_hour = replace_na(kg_hour, 0),
+         kg = kg_hour * (duration / 60),
+         density = kg / swept_area) %>% 
+  distinct(haul_id, .keep_all = TRUE) %>% 
+  filter(density < quantile(density, probs = 0.999)) %>% 
+  dplyr::select(date, year, quarter, month, subdiv, lat, long, density) %>% 
+  mutate(lat = floor(lat/100)+(lat-100*floor(lat/100))/60,
+         lon = floor(long/100)+(long-100*floor(long/100))/60,
+         lat = ifelse(lat<0,-1*lat,lat),
+         lon = ifelse(long<0,-1*lon,lon)) %>% 
+  add_utm_columns(ll_names = c("lon", "lat"))
+```
+
+### Add covariates
+Add depth
+
+```{r}
+depth_box <- getNOAA.bathy(min(d$lon) - .1, max(d$lon) + .1, min(d$lat)  - .1, max(d$lat) + .1)
+
+d$depth <- get.depth(depth_box, x=d$lon, y=d$lat, locator=F)$depth*(-1)
+```
+
+Add temperature
+
+```{r}
+covPath <- paste0(home, "/data/covariates")
+
+# Source: https://data.marine.copernicus.eu/product/GLOBAL_MULTIYEAR_PHY_001_030/download?dataset=cmems_mod_glo_phy_my_0.083deg_P1M-m_202311
+# Print details
+print(nc_open(paste(covPath, "sst", "cmems_mod_glo_phy_my_0.083deg_P1M-m_1715939377383.nc", sep = "/")))
+
+temp_tibble <- tidync(paste(covPath, "sst",
+                            "cmems_mod_glo_phy_my_0.083deg_P1M-m_1715939377383.nc", sep = "/")) %>%
+  hyper_tibble() %>% 
+  mutate(date = as_datetime(time, origin = '1970-01-01')) %>%
+  mutate(month = month(date),
+         day = day(date),
+         year = year(date),
+         quarter = ifelse(month %in% c(1:3), 1, NA),
+         quarter = ifelse(month %in% c(7:9), 3, quarter)) %>% 
+  filter(quarter %in% c(1, 3)) %>% 
+  mutate(year_q = paste(year, quarter, sep = "_"))
+
+# Loop through all year combos, extract the temperatures at the data locations
+temp_list <- list()
+
+d <- d %>% 
+  mutate(year_q = paste(year, quarter, sep = "_")) %>% 
+  filter(year_q %in% temp_tibble$year_q)
+
+for(i in unique(d$year_q)) {
+  
+  d_sub <- filter(d, year_q == i)
+  temp_tibble_sub <- filter(temp_tibble, year_q == i)
+  
+  # Convert to raster
+  temp_raster <- as_spatraster(temp_tibble_sub, xycols = 2:3,
+                               crs = "WGS84", digits = 2)
+
+  ggplot() +
+    geom_spatraster(data = temp_raster$bottomT, aes(fill = bottomT)) + 
+    scale_fill_viridis(option = "magma") +
+    ggtitle(i)
+
+  # Extract from raster
+  d_sub$temp <- terra::extract(temp_raster$bottomT,
+                               d_sub %>% dplyr::select(lon, lat))$bottomT  
+    
+  # Save
+  temp_list[[i]] <- d_sub
+  
+}
+
+d <- bind_rows(temp_list)
+```
+
+### Save
+
+```{r}
+write_csv(d, paste0(home, "/data/clean/trawl.csv"))
+```
+
+

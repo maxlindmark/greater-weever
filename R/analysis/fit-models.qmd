@@ -1,0 +1,393 @@
+---
+title: "Fit models"
+author: "Max Lindmark & Francesca Vitale"
+date: today
+date-format: iso
+toc: true
+format: 
+  html:
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 100%
+editor: source
+---
+
+```{r load libraries}
+#| message: false
+#| warning: false
+
+# Load libraries
+library(tidyverse)
+library(tidylog)
+library(sdmTMB)
+library(patchwork)
+library(viridis)
+library(RColorBrewer)
+library(modelr)
+library(ggeffects)
+library(ggsidekick); theme_set(theme_sleek())
+
+home <- here::here()
+
+# Load all custom functions in R/function
+
+for(fun in list.files(paste0(home, "/R/functions"))){
+  source(paste(home, "R/functions", fun, sep = "/"))
+}
+```
+
+## Read and prepare data
+
+Read data & scale variables. Note we have convert data from catch per hour to catch per area in this [script](), to make better use of the `get_index` function in sdmTMB. Temperature data come from [GLOBAL_MULTIYEAR_PHY_001_030]( https://data.marine.copernicus.eu/product/GLOBAL_MULTIYEAR_PHY_001_030/download?dataset=cmems_mod_glo_phy_my_0.083deg_P1M-m_202311)
+
+```{r data}
+#| message: false
+d <- readr::read_csv(paste0(home, "/data/clean/trawl.csv")) %>% 
+  filter(depth > 0) %>% 
+  mutate(temp_sc = as.numeric(scale(temp)),
+         depth = log(depth), 
+         depth_sc = as.numeric(scale(depth)),
+         depth_sq = depth_sc*depth_sc,
+         quarter_f = as.factor(quarter),
+         year_f = as.factor(year))
+
+# Read prediction grid
+pred_grid <- readr::read_csv(paste0(home, "/data/clean/pred_grid.csv")) %>% 
+  filter(depth > 0) %>% 
+  mutate(temp_sc = as.numeric(scale(temp)),
+         depth = log(depth),
+         depth_sc = (depth - mean(d$depth)) / sd(d$depth),
+         depth_sq = depth_sc*depth_sc,
+         quarter_f = as.factor(quarter),
+         year_f = as.factor(year))
+```
+
+Fit models. Initial exploration suggest a delta_gamma model yields better residuals than a Tweedie or a [Poisson-link delta gamma](https://pbs-assess.github.io/sdmTMB/articles/web_only/poisson-link.html).
+
+```{r}
+#| message: false
+
+mesh <- make_mesh(d,
+                  xy_cols = c("X", "Y"),
+                  cutoff = 4)
+    
+ggplot() +
+  inlabru::gg(mesh$mesh) +
+  coord_fixed() +
+  geom_point(aes(X, Y), data = d, alpha = 0.2, size = 0.5) +
+  annotate("text", -Inf, Inf, label = paste("n knots = ", mesh$mesh$n), hjust = -0.1, vjust = 2) + 
+  labs(x = "Easting (km)", y = "Northing (km)")
+
+# Basic model
+m0 <- sdmTMB(
+  formula = density ~ year_f + s(depth_sc) + quarter_f + temp_sc,
+  # formula = list(density ~ year_f + s(depth_sc) + quarter_f + temp_sc,
+  #                density ~ year_f + quarter_f + temp_sc),
+  data = d,
+  mesh = mesh,
+  family = delta_gamma(),
+  spatiotemporal = "off",
+  spatial = "on",
+  time = "year")
+```
+
+```{r}
+# Spatiotemporal instead?
+library(tictoc)
+tic()
+m1 <- sdmTMB(
+  formula = density ~ year_f + s(depth_sc) + quarter_f + temp_sc,
+  data = d,
+  mesh = mesh,
+  family = delta_gamma(),
+  spatiotemporal = "IID",
+  spatial = "on",
+  time = "year")
+toc()
+
+AIC(m0, m1)
+```
+
+Check model convergence and fit. There 
+
+```{r}
+#| message: false
+#| warning: false
+
+sanity(m0)
+
+d$binom <- residuals(m0, model = 1)
+d$gamma <- residuals(m0, model = 2)
+
+d %>% 
+  pivot_longer(c(binom, gamma)) %>% 
+  ggplot(aes(sample = value)) +
+  stat_qq(size = 0.75, shape = 21, fill = NA) +
+  stat_qq_line() +
+  facet_wrap(~name) + 
+  labs(y = "Sample Quantiles", x = "Theoretical Quantiles") +
+  theme(aspect.ratio = 1)
+```
+
+## Conditional effects
+Initial exploration also suggests that depth should be modelled on the log scale. A smooth effect works nicely for the binomial part, but it can be questioned whether depth affects the biomass density at all. However, currently in delta models in sdmTMB, if using smoothers, the effect needs to shared among model components. We could circumvent this by providing different formulas in a list, say e.g., as linear and quadratic effect. But this works ok for now. It's just a very uncertain effect. The temperature effects are very strong and very linear!
+
+```{r}
+#| message: false
+#| fig-height: 8
+# Depth
+p1 <- visreg_delta(m0, xvar = "depth_sc", model = 1, gg = TRUE) + 
+  labs(x = "Scaled depth", title = "Binomial") 
+
+p2 <- visreg_delta(m0, xvar = "depth_sc", model = 2, gg = TRUE) +
+  labs(x = "Scaled depth", title = "Gamma")
+
+p1 / p2 + 
+  plot_layout(axes = "collect")
+
+# Temperature
+p3 <- visreg_delta(m0, xvar = "temp_sc", model = 1, gg = TRUE) +
+  labs(x = "Scaled temperature", title = "Binomial")
+
+p4 <- visreg_delta(m0, xvar = "temp_sc", model = 2, gg = TRUE) +
+  labs(x = "Scaled temperature", title = "Gamma")
+
+p3 / p4 +
+  plot_layout(axes = "collect")
+```
+
+## Spatial predictions
+
+```{r}
+#| message: false
+#| warning: false
+
+pred <- predict(m0, newdata = pred_grid, type = "response")
+
+# Spatial random
+p1 <- plot_map +
+  geom_raster(data = pred %>% filter(year == max(year)),
+              aes(X*1000, Y*1000, fill = omega_s1)) +
+  scale_fill_gradient2(name = "Spatial random effect") +
+  theme_sleek(base_size = 9) +
+  theme(legend.position.inside = c(0.25, 0.1),
+        legend.direction = "horizontal",
+        legend.key.width = unit(0.7, "cm"),
+        legend.key.height = unit(0.3, "cm")) +
+  guides(fill = guide_colorbar(position = "inside",
+                               title.position = "top",
+                               title.hjust = 0.5)) + 
+  geom_sf() +
+  labs(subtitle = "Binomial")
+
+p2 <- plot_map +
+  geom_raster(data = pred %>% filter(year == max(year)),
+              aes(X*1000, Y*1000, fill = omega_s2)) +
+  scale_fill_gradient2(name = "Spatial random effect") +
+  theme_sleek(base_size = 9) +
+  theme(legend.position.inside = c(0.25, 0.1),
+        legend.direction = "horizontal",
+        legend.key.width = unit(0.7, "cm"),
+        legend.key.height = unit(0.3, "cm")) +
+  guides(fill = guide_colorbar(position = "inside",
+                               title.position = "top",
+                               title.hjust = 0.5)) + 
+  geom_sf() +
+  labs(subtitle = "Gamma")
+
+p1 + p2
+```
+
+## Spatiotemporal predictions
+
+```{r}
+#| fig-height: 10
+#| message: false
+#| warning: false
+
+# Total predictions
+plot_map_fc +
+  geom_raster(data = pred %>% filter(quarter_f == "1"),
+              aes(X*1000, Y*1000, fill = est)) +
+  scale_fill_viridis(name = "Density (kg/km2)", trans = "sqrt") +
+  facet_wrap(~year, ncol = 5) +
+  theme_sleek(base_size = 9) +
+  theme(legend.position.inside = c(0.195, 0.75),
+        legend.direction = "vertical",
+        legend.key.width = unit(0.2, "cm"),
+        legend.key.height = unit(0.3, "cm"),
+        legend.title = element_text(size = 6)) +
+  guides(fill = guide_colorbar(
+    position = "bottom", 
+    title.position = "top",
+    direction = "horizontal",
+    title.hjust = 1, 
+    theme = theme(legend.key.width  = unit(3, "cm")))) + 
+  geom_sf() + 
+  labs(subtitle = "Quarter 1")
+
+plot_map_fc +
+  geom_raster(data = pred %>% filter(quarter_f == "3"),
+              aes(X*1000, Y*1000, fill = est)) +
+  scale_fill_viridis(name = "Density (kg/km2)", trans = "sqrt") +
+  facet_wrap(~year, ncol = 5) +
+  theme_sleek(base_size = 9) +
+  theme(legend.position.inside = c(0.195, 0.75),
+        legend.direction = "vertical",
+        legend.key.width = unit(0.2, "cm"),
+        legend.key.height = unit(0.3, "cm"),
+        legend.title = element_text(size = 6)) +
+  guides(fill = guide_colorbar(
+    position = "bottom", 
+    title.position = "top",
+    direction = "horizontal",
+    title.hjust = 1, 
+    theme = theme(legend.key.width  = unit(3, "cm")))) + 
+  geom_sf() + 
+  labs(subtitle = "Quarter 3")
+```
+
+Select a few years and plot quarters next to each other
+
+```{r}
+plot_map_fc +
+  geom_raster(data = pred %>%
+                filter(year %in% c(1993, 2001, 2000)),
+              aes(X*1000, Y*1000, fill = est)) +
+  scale_fill_viridis(name = "Density (kg/km2)", trans = "sqrt") +
+  facet_grid(quarter~year) +
+  theme_sleek(base_size = 9) +
+  theme(legend.position.inside = c(0.195, 0.75),
+        legend.direction = "vertical",
+        legend.key.width = unit(0.2, "cm"),
+        legend.key.height = unit(0.3, "cm"),
+        legend.title = element_text(size = 6)) +
+  guides(fill = guide_colorbar(position = "bottom", 
+    title.position = "top",
+    direction = "horizontal",
+    title.hjust = 1, 
+    theme = theme(legend.key.width  = unit(3, "cm")))) + 
+  geom_sf()
+```
+
+## Plot area occupied over time
+
+```{r}
+#| warning: false
+#| message: false
+
+# Here simply defined as grids with >50% probability of ocurrence
+pred <- predict(m0, newdata = pred_grid, type = "response")
+
+pred %>% 
+  mutate(presence = ifelse(est1 > 0.2, 1, 0)) %>% 
+  summarise(n = sum(presence), .by = c(year, quarter)) %>% 
+  ggplot(aes(year, n, color = factor(quarter), fill = factor(quarter))) + 
+  geom_point() +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  labs(color = "Quarter", fill = "Quarter", x = "Year",
+       y = "Number of cells with probability of occurence > 20%") +
+  geom_smooth(method = "gam", formula = y~s(x, k = 4)) + 
+  theme(legend.position = "top")
+```
+
+### Get index over time
+
+```{r}
+#| warning: false
+#| message: false
+
+pred_q1 <- predict(m0, newdata = pred_grid %>% filter(quarter == 1),
+                   return_tmb_object = TRUE)
+
+pred_q3 <- predict(m0, newdata = pred_grid %>% filter(quarter == 3),
+                   return_tmb_object = TRUE)
+
+index_q1 <- get_index(pred_q1, area = 9, bias_correct = FALSE)
+index_q3 <- get_index(pred_q3, area = 9, bias_correct = FALSE)
+
+index <- bind_rows(index_q1 %>% mutate(quarter = as.factor(1)),
+                   index_q3 %>% mutate(quarter = as.factor(3)))
+
+# Mean in data
+d %>% 
+  summarise(dens = mean(density), .by = c(year, quarter)) %>% 
+  ggplot(aes(year, dens, color = as.factor(quarter))) + 
+  geom_line() +
+  scale_color_brewer(palette = "Set1", name = "Quarter") +
+  theme(legend.position = "top") +
+  labs(subtitle = "Mean density in data",
+       x = "Year", y = "Density (kg/km2)")
+  
+# Index
+ggplot(index, aes(year, est/1000, color = quarter, fill = quarter)) +
+  geom_ribbon(aes(ymin = lwr/1000, ymax = upr/1000), alpha = 0.3, color = NA) +
+  geom_line() +
+  scale_color_brewer(palette = "Set1") + 
+  scale_fill_brewer(palette = "Set1") +
+    labs(subtitle = "Spatiotemporal index", color = "Quarter",
+         fill = "Quarter", x = "Year", y = "Biomass estimate (tonnes)")
+```
+
+## What are the temperature trends over time? And how do they relate to the index?
+
+```{r}
+#| message: false
+#| fig-height: 8
+
+pred_grid %>% 
+  summarise("Mean temperature" = mean(temp), .by = c(year, quarter_f)) %>% 
+  ggplot(aes(year, `Mean temperature`, color = quarter_f)) + 
+  geom_line() +
+  labs(x = "Year") + 
+  facet_wrap(~quarter_f, scales = "free", ncol = 1) +
+  scale_color_brewer(palette = "Set1") + 
+  guides(color = "none")
+
+mean_temps <- pred_grid %>%
+  summarise("Mean temperature" = mean(temp), .by = c(year, quarter_f)) %>% 
+  rename(quarter = quarter_f)
+```
+
+```{r}
+#| message: false
+
+index_temp <- index %>%
+  left_join(mean_temps, by = c("year", "quarter"))
+  
+index_temp %>% 
+  rename(Tonnes = est) %>% 
+  ggplot(aes(`Mean temperature`, Tonnes)) + 
+  geom_point() +
+  theme(aspect.ratio = 1) + 
+  facet_wrap(~quarter, scales = "free")
+```
+
+Calculate z-scores and plot over time
+
+```{r}
+#| message: false
+#| fig-height: 8
+
+index_temp %>% 
+  rename(Tonnes = est) %>% 
+  dplyr::select(year, Tonnes, quarter, `Mean temperature`) %>% 
+  pivot_longer(c(Tonnes, `Mean temperature`)) %>% 
+  mutate(z = (value - mean(value)) / sd(value), .by = c("name", "quarter")) %>% 
+  ggplot(aes(year, z, color = name)) + 
+  geom_line() +
+  labs(color = "", x = "Year") +
+  scale_color_brewer(palette = "Set1") + 
+  facet_wrap(~quarter, scales = "free", ncol = 1) + 
+  theme(legend.position = "top")
+```
+
+
+
+
+
+
