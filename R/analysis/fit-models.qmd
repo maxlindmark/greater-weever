@@ -21,6 +21,7 @@ editor: source
 
 # Load libraries
 library(tidyverse)
+library(ggaqua)
 library(tidylog)
 library(sdmTMB)
 library(patchwork)
@@ -47,6 +48,7 @@ Read data & scale variables. Note we have convert data from catch per hour to ca
 #| message: false
 d <- readr::read_csv(paste0(home, "/data/clean/trawl.csv")) %>% 
   filter(depth > 0) %>% 
+  drop_na(temp) %>% 
   mutate(temp_sc = as.numeric(scale(temp)),
          depth = log(depth), 
          depth_sc = as.numeric(scale(depth)),
@@ -56,6 +58,7 @@ d <- readr::read_csv(paste0(home, "/data/clean/trawl.csv")) %>%
 
 # Read prediction grid
 pred_grid <- readr::read_csv(paste0(home, "/data/clean/pred_grid.csv")) %>% 
+  drop_na(temp) %>% 
   filter(depth > 0) %>% 
   mutate(temp_sc = as.numeric(scale(temp)),
          depth = log(depth),
@@ -348,6 +351,23 @@ ggplot(index, aes(year, est/1000, color = quarter, fill = quarter)) +
          fill = "Quarter", x = "Year", y = "Biomass estimate (tonnes)")
 ```
 
+## For ROM
+
+```{r}
+index %>% 
+  filter(quarter == 3) %>% 
+  ggplot(aes(year, est/1000)) +
+  theme_aqua() +
+  scale_x_continuous(expand = c(0, 0), breaks = scales::pretty_breaks(n = 6)) +
+  scale_y_continuous(expand = c(0, 0), breaks = scales::pretty_breaks(n = 5)) +
+  geom_ribbon(aes(ymin = lwr/1000, ymax = upr/1000), alpha = 0.3, color = NA) +
+  geom_line() +
+  labs(x = "", y = "Biomassaindex (ton)")
+
+ggsave(paste0(home, "/figures/fiskbarometern/Fig_3_maxlindmark.png"), dpi = 300, width = 8, height = 8, units = "cm")
+```
+
+
 ## What are the temperature trends over time? And how do they relate to the index?
 
 ```{r}
@@ -400,3 +420,65 @@ index_temp %>%
   facet_wrap(~quarter, scales = "free", ncol = 1) + 
   theme(legend.position = "bottom")
 ```
+
+## Now compare an index for the full time series (without temperature)
+
+```{r}
+#| message: false
+d2 <- readr::read_csv(paste0(home, "/data/clean/trawl.csv")) %>% 
+  filter(depth > 0) %>% 
+  mutate(depth = log(depth), 
+         depth_sc = as.numeric(scale(depth)),
+         depth_sq = depth_sc*depth_sc,
+         quarter_f = as.factor(quarter),
+         year_f = as.factor(year))
+
+# Read prediction grid
+pred_grid2 <- readr::read_csv(paste0(home, "/data/clean/pred_grid.csv")) %>% 
+  filter(depth > 0) %>% 
+  mutate(depth = log(depth),
+         depth_sc = (depth - mean(d$depth)) / sd(d$depth),
+         depth_sq = depth_sc*depth_sc,
+         quarter_f = as.factor(quarter),
+         year_f = as.factor(year))
+
+mesh <- make_mesh(d2,
+                  xy_cols = c("X", "Y"),
+                  cutoff = 4)
+
+m2 <- sdmTMB(
+  formula = density ~ year_f + s(depth_sc) + quarter_f,
+  data = d2,
+  mesh = mesh,
+  family = delta_gamma(),
+  spatiotemporal = list("off", "IID"),
+  spatial = "on",
+  time = "year")
+
+sanity(m2)    
+
+pred2_q1 <- predict(m2, newdata = pred_grid2 %>% filter(quarter == 1),
+                    return_tmb_object = TRUE)
+
+pred2_q3 <- predict(m2, newdata = pred_grid2 %>% filter(quarter == 3),
+                    return_tmb_object = TRUE)
+
+index2_q1 <- get_index(pred2_q1, area = 9, bias_correct = FALSE)
+index2_q3 <- get_index(pred2_q3, area = 9, bias_correct = FALSE)
+
+index2 <- bind_rows(index2_q1 %>% mutate(quarter = as.factor(1)),
+                    index2_q3 %>% mutate(quarter = as.factor(3)))
+
+# Index
+ggplot(bind_rows(index2 %>% mutate(series = "long"),
+                 index %>% mutate(series = "temp")),
+       aes(year, est/1000, color = series, fill = series)) +
+  #geom_ribbon(aes(ymin = lwr/1000, ymax = upr/1000), alpha = 0.3, color = NA) +
+  geom_line() +
+  facet_wrap(~quarter, scales = "free") +
+  scale_color_brewer(palette = "Set1") + 
+  scale_fill_brewer(palette = "Set1") +
+  labs(subtitle = "Spatiotemporal index", color = "Quarter",
+       fill = "Quarter", x = "Year", y = "Biomass estimate (tonnes)")
+```
+
