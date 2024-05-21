@@ -46,11 +46,13 @@ home <- here::here()
 ```{r}
 #| message: false
 
-d <- read_delim(paste0(home, "/data/clean/fja_lenFreq.csv"), delim = ";")
+d <- read_delim(paste0(home, "/data/clean/fja_lenFreqSD2021Q3.csv"), delim = ";")
 
 # Tidy up data so that 1 row = 1 individual
 t <- d %>% 
   pivot_longer(-MeanLength) %>% 
+  drop_na(value) %>% 
+  mutate(value = round(value)) %>% 
   rename(length = MeanLength,
          year = name) %>% 
   uncount(value) %>% 
@@ -160,7 +162,7 @@ n_lev <- 3
 t %>% 
   filter(year > 1999) %>% 
   ggplot(aes(year, length)) +
-  geom_jitter(alpha = 0.15, color = "gray20", size = 0.2) +
+  geom_jitter(alpha = 0.1, color = "gray20", size = 0.2, height = 1) +
   #geom_density(aes(y = length), alpha = 0.2) +
   labs(y = "Längd (mm)", x = "", color = "Kvantil", fill = "Kvantil") + 
   scale_color_manual(values = as.vector(pal)) +
