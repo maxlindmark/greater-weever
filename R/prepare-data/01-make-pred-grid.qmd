@@ -165,12 +165,14 @@ temp_tibble <- tidync(paste(covPath, "sst",
 temp_list <- list()
 
 pred_grid <- pred_grid %>% 
-  mutate(year_q = paste(year, quarter, sep = "_")) %>% 
+  mutate(year_q = paste(year, quarter, sep = "_"))
+
+pred_grid_temp <- pred_grid %>% 
   filter(year_q %in% temp_tibble$year_q)
 
-for(i in unique(pred_grid$year_q)) {
+for(i in unique(pred_grid_temp$year_q)) {
   
-  d_sub <- filter(pred_grid, year_q == i)
+  d_sub <- filter(pred_grid_temp, year_q == i)
   temp_tibble_sub <- filter(temp_tibble, year_q == i)
   
   # Convert to raster
@@ -191,9 +193,10 @@ for(i in unique(pred_grid$year_q)) {
   
 }
 
-pred_grid <- bind_rows(temp_list)
+pred_grid_temp <- bind_rows(temp_list) %>% drop_na(temp)
 
-pred_grid <- pred_grid %>% drop_na(temp)
+pred_grid <- bind_rows(pred_grid_temp,
+                       pred_grid %>% filter(!year_q %in% unique(pred_grid_temp$year_q)))
 ```
 
 ## Save

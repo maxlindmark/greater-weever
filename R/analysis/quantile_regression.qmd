@@ -1,0 +1,205 @@
+---
+title: "Large fish index using Bayesian quantile regression"
+author: "Max Lindmark, Francesca Vitale"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 80%
+editor: source
+execute: 
+  echo: true
+  eval: true
+  cache: false
+---
+
+## Load libraries
+
+```{r libraries and functions}
+#| message: false
+
+library(here)
+library(tidyverse)
+library(tidylog)
+library(RColorBrewer)
+library(viridis)
+library(brms)
+library(qgam)
+library(ggridges)
+library(tidylog)
+library(tictoc)
+library(ggaqua)
+
+# devtools::install_github("seananderson/ggsidekick") # not on CRAN 
+library(ggsidekick); theme_set(theme_sleek())
+
+# Set path:
+home <- here::here()
+```
+
+## Read & tidy data
+
+```{r}
+#| message: false
+
+d <- read_delim(paste0(home, "/data/clean/fja_lenFreq.csv"), delim = ";")
+
+# Tidy up data so that 1 row = 1 individual
+t <- d %>% 
+  pivot_longer(-MeanLength) %>% 
+  rename(length = MeanLength,
+         year = name) %>% 
+  uncount(value) %>% 
+  mutate(year = as.numeric(year))
+```
+
+## Plot data
+
+```{r}
+#| message: false
+#| fig-height: 9
+
+ggplot(t, aes(length, as.factor(year))) +
+  stat_density_ridges(quantile_lines = TRUE, scale = 2, rel_min_height = 0.003, alpha = 0.5) + 
+  labs(x = "Längd (mm)", y = "")
+```
+
+```{r}
+#| message: false
+
+t %>% 
+  summarise(q10 = quantile(length, probs = 0.1),
+            q50 = quantile(length, probs = 0.5),
+            q90 = quantile(length, probs = 0.9), 
+            .by = year) %>% 
+  pivot_longer(c(q10, q50, q90), names_to = "quantile") %>% 
+  ggplot(aes(year, value, color = quantile)) + 
+  labs(y = "Length (mm)", x = "Year", color = "Quantile") + 
+  geom_line()
+```
+
+## Fit quantile regression
+
+### L90
+#### [Bayesian](https://discourse.mc-stan.org/t/interpreting-quantile-parameter-in-brms-quantile-regression/8706) 
+
+```{r}
+# tic()
+# qr90 <- brm(bf(length ~ as.factor(year), quantile = 0.9),
+#             data = t, 
+#             family = asym_laplace(),
+#             chains = 2,
+#             iter = 1500,
+#             seed = 99,
+#             cores = getOption("mc.cores", 4))
+# toc()
+```
+
+#### [qgam](https://mfasiolo.github.io/qgam/index.html)
+
+```{r}
+#| message: false
+
+tic()
+
+quSeq <- c(0.1, 0.5, 0.9)
+
+qr90b <- mqgam(length ~ s(year, k = 5), data = t, qu = quSeq)
+
+toc()
+
+summary(qr90b)
+```
+
+```{r}
+#| message: false
+# Predict and plot
+
+preds <- list()
+
+for(i in 1:length(quSeq)){
+  
+  quSeq_i <- quSeq[i]
+  
+  nd <- tibble(year = seq(min(t$year), max(t$year), 1))
+  pred <- qdo(qr90b, quSeq_i, predict, newdata = nd, se = TRUE)
+  nd$pred <- as.numeric(pred$fit)
+  nd$se_pred <- as.numeric(pred$se.fit)
+  
+  preds[[i]] <- nd %>% mutate(quantile = as.factor(quSeq_i))
+  
+}
+
+preds_df <- bind_rows(preds)
+
+# Plot on top of data
+ggplot(t, aes(year, length)) +
+  geom_jitter(alpha = 0.2) +
+  labs(y = "Length (mm)", x = "Year", color = "Quantile", fill = "Quantile") + 
+  geom_line(data = preds_df, aes(year, pred, color = quantile), linewidth = 1.2) + 
+  geom_ribbon(aes(year, y = pred, ymin = pred - 1.96*se_pred, ymax = pred + 1.96*se_pred, fill = quantile),
+              data = preds_df, alpha = 0.3) + 
+  scale_color_brewer(palette = "Set2") + 
+  scale_fill_brewer(palette = "Set2") +
+  theme(legend.position.inside = c(0.08, 0.9))  + 
+  guides(color = guide_legend(position = "inside"),
+         fill = guide_legend(position = "inside"))
+```
+
+Figure for ROM
+
+```{r}
+pal <- c("#56B4E9", "#009E73", "#F0E442", "#0072B2", "#E69F00", "#D55E00")
+
+n_lev <- 3
+
+t %>% 
+  filter(year > 1999) %>% 
+  ggplot(aes(year, length)) +
+  geom_jitter(alpha = 0.15, color = "gray20", size = 0.2) +
+  #geom_density(aes(y = length), alpha = 0.2) +
+  labs(y = "Längd (mm)", x = "", color = "Kvantil", fill = "Kvantil") + 
+  scale_color_manual(values = as.vector(pal)) +
+  scale_fill_manual(values = as.vector(pal)) + 
+  geom_line(data = preds_df %>% filter(year > 1999), aes(year, pred, color = quantile), linewidth = 1) + 
+  geom_ribbon(aes(year, y = pred, ymin = pred - 1.96*se_pred, ymax = pred + 1.96*se_pred, fill = quantile),
+              data = preds_df %>% filter(year > 1999), alpha = 0.3) +
+  theme_aqua() +
+  scale_x_continuous(expand = c(0, 0), breaks = scales::pretty_breaks(n = 6)) +
+  scale_y_continuous(expand = c(0, 0), breaks = scales::pretty_breaks(n = 5)) + 
+  guides(fill = "none",
+         alpha = "none",
+         color = guide_legend(nrow = 1,
+                              title = "",
+                              override.aes = list(size = 1.3,
+                                                  color = pal[seq(1, n_lev)]),
+                              keywidth = 0.3,
+                              keyheight = 0.1,
+                              default.unit = "inch"))
+
+ggsave(paste0(home, "/figures/fiskbarometern/Fig_4_maxlindmark.png"), dpi = 300, width = 8, height = 8, units = "cm")
+```
+
+
+And as table
+
+```{r}
+#| message: false
+
+preds_df %>% 
+  dplyr::select(-se_pred) %>% 
+  rename(Year = year) %>% 
+  mutate(pred = round(pred)) %>% 
+  pivot_wider(values_from = pred, names_from = quantile) %>% 
+  knitr::kable(format = "html")
+```
+
+
+
+
+
+
