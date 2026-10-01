@@ -38,7 +38,7 @@ theme_facet_map <- function(base_size = 11, base_family = "") {
       legend.key.width = unit(2, "line"),
       legend.spacing.x = unit(0.1, 'cm'),
       #legend.position = "bottom",
-      legend.position = c(0.73, 0.04)
+      legend.position.inside = c(0.73, 0.04)
     )
 }
 
@@ -59,8 +59,8 @@ plot_map <-
   labs(x = "Longitude", y = "Latitude") +
   geom_sf(size = 0.3, color = "gray80") + 
   theme_sleek() +
-  guides(colour = guide_colorbar(title.position = "top", title.hjust = 0.5),
-         fill = guide_colorbar(title.position = "top", title.hjust = 0.5)) +
+  guides(colour = guide_colorbar(title.position = "top", title.hjust = 0.5, position = "inside"),
+         fill = guide_colorbar(title.position = "top", title.hjust = 0.5), position = "inside") +
   NULL
 
 plot_map_fc <- 

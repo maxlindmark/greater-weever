@@ -1,0 +1,145 @@
+---
+title: "Fit models"
+author: "Max Lindmark & Francesca Vitale"
+date: today
+date-format: iso
+toc: true
+format: 
+  html:
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 100%
+editor: source
+---
+
+```{r load libraries}
+#| message: false
+#| warning: false
+
+# Load libraries
+library(tidyverse)
+library(ggaqua)
+library(tidylog)
+library(sdmTMB)
+library(patchwork)
+library(viridis)
+library(RColorBrewer)
+library(modelr)
+library(ggtext)
+library(tictoc)
+library(ggsidekick); theme_set(theme_sleek())
+
+home <- here::here()
+
+# Load all custom functions in R/function
+
+for(fun in list.files(paste0(home, "/R/functions"))){
+  source(paste(home, "R/functions", fun, sep = "/"))
+}
+```
+
+## Read and prepare data
+
+Read data & scale variables. Note we have convert data from catch per hour to catch per area in this [script](https://github.com/maxlindmark/greater-weever/blob/main/R/prepare-data/00-prep-data.qmd), to make better use of the `get_index` function in sdmTMB. 
+
+```{r data}
+#| message: false
+d <- readr::read_csv(paste0(home, "/data/clean/trawl.csv")) |> 
+  filter(depth > 0) |> 
+  drop_na(temp) |> 
+  filter(quarter %in% c(1, 3)) |> 
+  mutate(temp_sc = as.numeric(scale(temp)),
+         depth = log(depth), 
+         depth_sc = as.numeric(scale(depth)),
+         depth_sq = depth_sc*depth_sc,
+         quarter_f = as.factor(quarter),
+         year_f = as.factor(year))
+
+# Read prediction grid
+pred_grid <- readr::read_csv(paste0(home, "/data/clean/pred_grid.csv")) |> 
+  drop_na(temp) |> 
+  filter(depth > 0) |> 
+  mutate(temp_sc = as.numeric(scale(temp)),
+         depth = log(depth),
+         depth_sc = (depth - mean(d$depth)) / sd(d$depth),
+         depth_sq = depth_sc*depth_sc,
+         quarter_f = as.factor(quarter),
+         year_f = as.factor(year))
+```
+
+Fit models. Initial exploration suggest a delta_gamma model [Poisson-link delta gamma](https://pbs-assess.github.io/sdmTMB/articles/web_only/poisson-link.html). Note that we need to put an ar1 on the intercept. Typically we model year as a factor to get independent estimates. However in this case, we are missing q3 data in year 2000. This somehow makes the yearf estimate for 2000 very high, because there's nothing to inform i, aand q1 in 2000 is one of the largest years. Allowing the year effect to evolve through time doesn't mean it estimates separate year effects for each quarter, just that it gets a memory. In theory we could go for a rw0 on time rather than ar1, because correlation is near one, but i get worse diagnistics then.
+
+The big year_f2000 comes from the model trying to fit the unusually large quarter-1 observations in 2000, and because the fixed-effects model multiplies year and quarter effects, that large year multiplier then amplifies the global quarter-3 multiplier when you ask the model for a 2000×Q3 prediction. The AR1/time-varying model doesn’t blow up because it partially pools (shrinks) the 2000 year effect toward neighboring years, so the amplification is tamed.
+
+Regarding fields:
+Interpolation of 1–2 missing years:
+AR1 usually preferable — gives stable interpolation. Long-term drifting patterns (e.g., species range shift):
+RW may be more realistic. Forecasting beyond observed years: AR1 shrinks forecasts back toward the long-run mean field. RW allows forecasts to wander off (with big uncertainty).
+
+```{r}
+#| message: false
+
+mesh <- make_mesh(d, 
+                  xy_cols = c("X", "Y"),
+                  cutoff = 4)
+    
+ggplot() +
+  inlabru::gg(mesh$mesh) +
+  coord_fixed() +
+  geom_point(aes(X, Y), data = d, alpha = 0.2, size = 0.5) +
+  annotate("text", -Inf, Inf, label = paste("n knots = ", mesh$mesh$n), hjust = -0.1, vjust = 2) + 
+  labs(x = "Easting (km)", y = "Northing (km)")
+```
+
+Fit AIC-selected model
+
+```{r}
+# Spatiotemporal ar1 and squared depth for binomial and linear for gamma, allow spatial fields to vary with quarter?
+tic()
+m5 <- sdmTMB(
+  formula = list(density ~ depth_sc + depth_sq + temp_sc + quarter_f,
+                 density ~ depth_sc + temp_sc + quarter_f),
+  data = d,
+  mesh = mesh,
+  family = delta_gamma(type = "poisson-link"),
+  time_varying = ~1,
+  time_varying_type = "ar1",
+  spatiotemporal = list("off", "ar1"),
+  spatial = "off",
+  spatial_varying = ~ 0 + quarter_f,
+  time = "year")
+toc()
+
+tidy(m5, effects = "ran_pars")
+
+sanity(m5)
+```
+
+### Get index over time
+
+```{r}
+#| warning: false
+#| message: false
+
+pred_tmb_q3 <- predict(
+  m5,
+  newdata = pred_grid |> filter(quarter == 3),
+  return_tmb_object = TRUE)
+
+index_q3 <- get_index(pred_tmb_q3, area = 9, bias_correct = TRUE, level = 0.95)
+
+index_q3 |> 
+  ggplot(aes(year, est/1000)) +
+  theme_aqua() +
+  scale_x_continuous(expand = c(0, 0), breaks = scales::pretty_breaks(n = 6)) +
+  scale_y_continuous(expand = c(0, 0), breaks = scales::pretty_breaks(n = 5)) +
+  geom_ribbon(aes(ymin = lwr/1000, ymax = upr/1000), alpha = 0.3, color = NA) +
+  geom_line() +
+  labs(x = "", y = "Biomassaindex (ton)")
+
+ggsave(paste0(home, "/figures/fiskbarometern/Fig_3_maxlindmark.png"),
+       dpi = 300, width = 8, height = 8, units = "cm")
+```

@@ -79,10 +79,11 @@ pred_grid <- expand.grid(
   X = seq(min(d$X), max(d$X), cell_width),
   Y = seq(min(d$Y), max(d$Y), cell_width),
   year = seq(min(d$year), max(d$year)),
-  quarter = c(1, 3)
-  )
+  quarter = c(1, 3)) |> 
+  mutate(month = ifelse(quarter == 1, 2, 8),
+         year_month = paste(year, month, sep = "_"))
 
-ggplot(pred_grid %>% filter(year == 2019), aes(X, Y)) +
+ggplot(pred_grid |> filter(year == 2019), aes(X, Y)) +
   geom_point(size = 0.1) +
   theme_void() +
   coord_sf()
@@ -102,7 +103,7 @@ plot_map +
 # Add lat and lon
 # Need to go from UTM to lat long for this one...
 # https://stackoverflow.com/questions/30018098/how-to-convert-utm-coordinates-to-lat-and-long-in-r
-xy <- as.matrix(pred_grid %>% dplyr::select(X, Y) %>% mutate(X = X*1000, Y = Y*1000))
+xy <- as.matrix(pred_grid |> dplyr::select(X, Y) |> mutate(X = X*1000, Y = Y*1000))
 v <- terra::vect(xy, crs="+proj=utm +zone=32 +datum=WGS84  +units=m")
 y <- project(v, "+proj=longlat +datum=WGS84")
 lonlat <- geom(y)[, c("x", "y")]
@@ -128,9 +129,9 @@ plot_map +
   geom_sf()
 
 # Remove Denmanrk... 
-pred_grid <- pred_grid %>% 
-  mutate(keep = ifelse(lat < 57.103 & lon < 10.28, "N", "Y")) %>% 
-  filter(keep == "Y") %>% 
+pred_grid <- pred_grid |> 
+  mutate(keep = ifelse(lat < 57.103 & lon < 10.28, "N", "Y")) |> 
+  filter(keep == "Y") |> 
   dplyr:::select(-keep)
 
 plot_map +
@@ -143,64 +144,61 @@ plot_map +
 Add temperature
 
 ```{r}
-covPath <- paste0(home, "/data/covariates")
-
-# Source: https://data.marine.copernicus.eu/product/GLOBAL_MULTIYEAR_PHY_001_030/download?dataset=cmems_mod_glo_phy_my_0.083deg_P1M-m_202311
-# Print details
-print(nc_open(paste(covPath, "sst", "cmems_mod_glo_phy_my_0.083deg_P1M-m_1715939377383.nc", sep = "/")))
-
-temp_tibble <- tidync(paste(covPath, "sst",
-                            "cmems_mod_glo_phy_my_0.083deg_P1M-m_1715939377383.nc", sep = "/")) %>%
-  hyper_tibble() %>% 
-  mutate(date = as_datetime(time, origin = '1970-01-01')) %>%
-  mutate(month = month(date),
-         day = day(date),
-         year = year(date),
-         quarter = ifelse(month %in% c(1:3), 1, NA),
-         quarter = ifelse(month %in% c(7:9), 3, quarter)) %>% 
-  filter(quarter %in% c(1, 3)) %>% 
-  mutate(year_q = paste(year, quarter, sep = "_"))
-
-# Loop through all year combos, extract the temperatures at the data locations
-temp_list <- list()
-
-pred_grid <- pred_grid %>% 
-  mutate(year_q = paste(year, quarter, sep = "_"))
-
-pred_grid_temp <- pred_grid %>% 
-  filter(year_q %in% temp_tibble$year_q)
-
-for(i in unique(pred_grid_temp$year_q)) {
+# New approach based on ensemble forecast
+read_trim_nc <- function(file_path){
   
-  d_sub <- filter(pred_grid_temp, year_q == i)
-  temp_tibble_sub <- filter(temp_tibble, year_q == i)
-  
-  # Convert to raster
-  temp_raster <- as_spatraster(temp_tibble_sub, xycols = 2:3,
-                               crs = "WGS84", digits = 2)
-
-  ggplot() +
-    geom_spatraster(data = temp_raster$bottomT, aes(fill = bottomT)) + 
-    scale_fill_viridis(option = "magma") +
-    ggtitle(i)
-
-  # Extract from raster
-  d_sub$temp <- terra::extract(temp_raster$bottomT,
-                               d_sub %>% dplyr::select(lon, lat))$bottomT  
-    
-  # Save
-  temp_list[[i]] <- d_sub
-  
+  tidync(file_path) |>
+    hyper_tibble() |>
+    mutate(date = as.Date(time, origin = "1993-01-01"),
+           year = year(date),
+           month = month(date),
+           day = day(date),
+           year = year(date),
+           year_month = paste(year, month, sep = "_")) |> 
+    filter(year_month %in% c(unique(pred_grid$year_month)) & day == 1 & lon > 7 & lon < 15 & lat > 54 & lat < 61 & percentiles == 50)
 }
 
-pred_grid_temp <- bind_rows(temp_list) %>% drop_na(temp)
+print(
+  nc_open(
+    "/Users/maxlindmark/Dropbox/max-work/R/larvae-sizes/data/covariates/ensemble/thetao_ensemble_sd+ba_surface_depth_5.0_perc_ssp245.nc"))
 
-pred_grid <- bind_rows(pred_grid_temp,
-                       pred_grid %>% filter(!year_q %in% unique(pred_grid_temp$year_q)))
+st_tibble5 <- read_trim_nc("/Users/maxlindmark/Dropbox/max-work/R/larvae-sizes/data/covariates/ensemble/thetao_ensemble_sd+ba_surface_depth_5.0_perc_ssp245.nc")
+
+# Loop through all year/month combos, extract the temperatures at the data locations
+temp_list <- list()
+
+for (i in unique(pred_grid$year_month)) {
+  d_sub <- filter(pred_grid, year_month == i)
+  temp_tibble_sub <- filter(st_tibble5, year_month == i)
+
+  # Convert to raster
+  temp_raster <- as_spatraster(temp_tibble_sub,
+    xycols = 3:4,
+    crs = "WGS84", digits = 3
+  )
+
+  # Extract from raster
+  d_sub$temp <- terra::extract(
+    temp_raster$thetao,
+    d_sub |> dplyr::select(lon, lat)
+  )$thetao
+
+  # Save
+  temp_list[[i]] <- d_sub
+}
+
+d_temp <- bind_rows(temp_list)
+
+pred_grid_temp <- bind_rows(temp_list) |> tidylog::drop_na(temp)
+
+plot_map + 
+  geom_raster(data = pred_grid_temp, aes(X*1000, Y*1000, fill = temp)) +
+  facet_wrap(~year) + 
+  scale_fill_viridis(option = "magma")
 ```
 
 ## Save
 
 ```{r save}
-write_csv(pred_grid, file = paste0(home, "/data/clean/pred_grid.csv"))
+write_csv(pred_grid_temp, file = paste0(home, "/data/clean/pred_grid.csv"))
 ```

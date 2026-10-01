@@ -1,0 +1,86 @@
+---
+title: "Make ALK"
+author: "Max Lindmark"
+date: today
+date-format: iso
+toc: true
+format: 
+  html:
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 100%
+editor: source
+---
+
+```{r load libraries}
+#| message: false
+#| warning: false
+
+# Load libraries
+library(tidyverse)
+library(tidylog)
+library(patchwork)
+library(icesDatras)
+library(ggsidekick); theme_set(theme_sleek())
+
+home <- here::here()
+```
+
+Load data
+
+```{r}
+# Read HH data
+ibits_hh <- getDATRAS(record = "HH", survey = "NS-IBTS", years = 2023:2023, quarters = c(1, 3))
+# write_csv(ibits_hh, paste0(home, "/data/DATRAS/exchange/bits_hh.csv"))
+ibits_hh <- read_csv(paste0(home, "/data/DATRAS/exchange/bits_hh.csv"))
+
+# Read HL data
+# Need to loop by year and filter greater weaver 
+# hl_list <- list()
+# years = 1993:2023
+# 
+# for(i in years){
+#   
+#   temp <- getDATRAS(record = "HL", survey = "NS-IBTS", years = i, quarters = c(1, 3)) |> 
+#     filter(SpecCode == 170992) |> 
+#     mutate(LngtCode = as.integer(LngtCode),
+#            DevStage = as.character(DevStage))
+# 
+#   hl_list[[i]] <- temp
+#   
+# }
+# 
+# ibits_hl <- bind_rows(hl_list)
+
+# write_csv(ibits_hl, paste0(home, "/data/DATRAS/exchange/ibits_hl.csv"))
+ibits_hl <- read_csv(paste0(home, "/data/DATRAS/exchange/ibits_hl.csv"))
+
+# Read CA data
+# Need to loop by year and filter greater weaver 
+ca_list <- list()
+years = 1993:2023
+
+for(i in years){
+  
+  temp <- getDATRAS(record = "CA", survey = "NS-IBTS", years = i, quarters = c(1, 3)) |> 
+    filter(SpecCode == 170992) |> 
+    mutate(GearEx = as.character(GearEx),
+           StNo = as.character(StNo))
+
+  ca_list[[i]] <- temp
+  
+}
+
+ibits_ca <- bind_rows(ca_list)
+
+# write_csv(ibits_hl, paste0(home, "/data/DATRAS/exchange/ibits_hl.csv"))
+ibits_hl <- read_csv(paste0(home, "/data/DATRAS/exchange/ibits_hl.csv"))
+# bits_ca <- getDATRAS(record = "CA", survey = "BITS", years = 2010:2023, quarters = c(1, 4))
+# write_csv(bits_ca, paste0(home, "/data/DATRAS/exchange/bits_ca.csv"))
+bits_ca <- read_csv(paste0(home, "/data/DATRAS/exchange/bits_ca.csv"))
+
+```
+

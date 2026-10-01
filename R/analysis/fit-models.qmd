@@ -28,7 +28,8 @@ library(patchwork)
 library(viridis)
 library(RColorBrewer)
 library(modelr)
-library(ggeffects)
+library(ggtext)
+library(tictoc)
 library(ggsidekick); theme_set(theme_sleek())
 
 home <- here::here()
@@ -42,13 +43,14 @@ for(fun in list.files(paste0(home, "/R/functions"))){
 
 ## Read and prepare data
 
-Read data & scale variables. Note we have convert data from catch per hour to catch per area in this [script](https://github.com/maxlindmark/greater-weever/blob/main/R/prepare-data/00-prep-data.qmd), to make better use of the `get_index` function in sdmTMB. Temperature data come from [GLOBAL_MULTIYEAR_PHY_001_030]( https://data.marine.copernicus.eu/product/GLOBAL_MULTIYEAR_PHY_001_030/download?dataset=cmems_mod_glo_phy_my_0.083deg_P1M-m_202311)
+Read data & scale variables. Note we have convert data from catch per hour to catch per area in this [script](https://github.com/maxlindmark/greater-weever/blob/main/R/prepare-data/00-prep-data.qmd), to make better use of the `get_index` function in sdmTMB. 
 
 ```{r data}
 #| message: false
-d <- readr::read_csv(paste0(home, "/data/clean/trawl.csv")) %>% 
-  filter(depth > 0) %>% 
-  drop_na(temp) %>% 
+d <- readr::read_csv(paste0(home, "/data/clean/trawl.csv")) |> 
+  filter(depth > 0) |> 
+  drop_na(temp) |> 
+  filter(quarter %in% c(1, 3)) |> 
   mutate(temp_sc = as.numeric(scale(temp)),
          depth = log(depth), 
          depth_sc = as.numeric(scale(depth)),
@@ -57,9 +59,9 @@ d <- readr::read_csv(paste0(home, "/data/clean/trawl.csv")) %>%
          year_f = as.factor(year))
 
 # Read prediction grid
-pred_grid <- readr::read_csv(paste0(home, "/data/clean/pred_grid.csv")) %>% 
-  drop_na(temp) %>% 
-  filter(depth > 0) %>% 
+pred_grid <- readr::read_csv(paste0(home, "/data/clean/pred_grid.csv")) |> 
+  drop_na(temp) |> 
+  filter(depth > 0) |> 
   mutate(temp_sc = as.numeric(scale(temp)),
          depth = log(depth),
          depth_sc = (depth - mean(d$depth)) / sd(d$depth),
@@ -68,12 +70,19 @@ pred_grid <- readr::read_csv(paste0(home, "/data/clean/pred_grid.csv")) %>%
          year_f = as.factor(year))
 ```
 
-Fit models. Initial exploration suggest a delta_gamma model yields better residuals than a Tweedie or a [Poisson-link delta gamma](https://pbs-assess.github.io/sdmTMB/articles/web_only/poisson-link.html).
+Fit models. Initial exploration suggest a delta_gamma model [Poisson-link delta gamma](https://pbs-assess.github.io/sdmTMB/articles/web_only/poisson-link.html). Note that we need to put an ar1 on the intercept. Typically we model year as a factor to get independent estimates. However in this case, we are missing q3 data in year 2000. This somehow makes the yearf estimate for 2000 very high, because there's nothing to inform i, aand q1 in 2000 is one of the largest years. Allowing the year effect to evolve through time doesn't mean it estimates separate year effects for each quarter, just that it gets a memory. In theory we could go for a rw0 on time rather than ar1, because correlation is near one, but i get worse diagnistics then.
+
+The big year_f2000 comes from the model trying to fit the unusually large quarter-1 observations in 2000, and because the fixed-effects model multiplies year and quarter effects, that large year multiplier then amplifies the global quarter-3 multiplier when you ask the model for a 2000×Q3 prediction. The AR1/time-varying model doesn’t blow up because it partially pools (shrinks) the 2000 year effect toward neighboring years, so the amplification is tamed.
+
+Regarding fields:
+Interpolation of 1–2 missing years:
+AR1 usually preferable — gives stable interpolation. Long-term drifting patterns (e.g., species range shift):
+RW may be more realistic. Forecasting beyond observed years: AR1 shrinks forecasts back toward the long-run mean field. RW allows forecasts to wander off (with big uncertainty).
 
 ```{r}
 #| message: false
 
-mesh <- make_mesh(d,
+mesh <- make_mesh(d, 
                   xy_cols = c("X", "Y"),
                   cutoff = 4)
     
@@ -90,31 +99,131 @@ We can compare a model with a spatial random effect and one with a spatiotempora
 ```{r}
 # Basic model
 m0 <- sdmTMB(
-  formula = density ~ year_f + s(depth_sc) + quarter_f + temp_sc,
-  # formula = list(density ~ year_f + s(depth_sc) + quarter_f + temp_sc,
-  #                density ~ year_f + quarter_f + temp_sc),
+  formula = density ~ s(depth_sc) + temp_sc + quarter_f,
   data = d,
   mesh = mesh,
-  family = delta_gamma(),
+  family = delta_gamma(type = "poisson-link"),
+  time_varying = ~1,
+  time_varying_type = "ar1",
   spatiotemporal = "off",
-  spatial = "on",
+  spatial = "off",
   time = "year")
 
 sanity(m0)
 ```
 
-Inital exploration suggests the spatiotemporal random field for the bionomial model is estimated very small, hence it's omitted here and only applies to the gamma component.
+# RW?
+```{r}
+# Use AR1 if you expect short-term autocorrelation around a mean → good for fisheries survey data, environmental indices, where values tend to revert after a shock.
+# 
+# Use RW if you think the process drifts over time with no fixed mean → e.g., long-term climate trends, biomass with cumulative pressures.
+# 
+# For one or two missing years (interpolation only), both are reasonable, but AR1 is usually safer and produces more stable predictions.
+
+# mrw <- sdmTMB(
+#   formula = density ~ 0 + s(depth_sc) + temp_sc + quarter_f,
+#   data = d,
+#   mesh = mesh,
+#   family = tweedie(),
+#   time_varying = ~1,
+#   time_varying_type = "rw0",
+#   spatiotemporal = "off",
+#   spatial = "off",
+#   time = "year")
+# 
+# sanity(mrw)
+# 
+# tidy(mrw)
+# tidy(mrw)
+
+# TEST
+
+# m0 <- sdmTMB(
+#   formula = density ~ quarter_f,
+#   data = d,
+#   mesh = mesh,
+#   family = tweedie(),
+#   time_varying = ~1,
+#   time_varying_type = "ar1",
+#   spatiotemporal = "off",
+#   spatial = "off",
+#   time = "year")
+# 
+# # Basic model
+# m0b <- sdmTMB(
+#   formula = density ~ year_f + quarter_f,
+#   data = d,
+#   mesh = mesh,
+#   family = tweedie(),
+#   spatiotemporal = "off",
+#   spatial = "off",
+#   time = "year")
+# 
+# # Basic model
+# d2 <- d |> mutate(q_year = paste(quarter, year, sep = "_"))
+# m0c <- sdmTMB(
+#   formula = density ~ q_year,
+#   data = d2,
+#   mesh = mesh,
+#   family = tweedie(),
+#   spatiotemporal = "off",
+#   spatial = "off",
+#   time = "year")
+# 
+# tidy(m0b, exponentiate = TRUE) |> as.data.frame()
+# tidy(m0, exponentiate = TRUE) |> as.data.frame()
+# 
+# d |>
+#   filter(year == 2000) |> distinct(quarter)
+# 
+# nd <- tibble(year = as.numeric(1993:2025)) |>
+#   mutate(year_f = as.factor(year),
+#          temp_sc = 0,
+#          quarter = 3,
+#          quarter_f = as.factor(3),
+#          depth_sc = 0,
+#          depth_sq = 0) |>
+#   mutate(q_year = paste(quarter, year, sep = "_"))
+# 
+# nd$pred_m0_1 <- predict(m0, newdata = nd)$est
+# nd$pred_m0b_1 <- predict(m0b, newdata = nd)$est
+# nd$pred_m0c_1 <- predict(m0c, newdata = nd)$est
+# nd$pred_mrw <- predict(mrw, newdata = nd)$est
+# 
+# dmean <- d |>
+#   #filter(year > 1998 & year < 2003) |>
+#   summarise(mean = mean(density), .by = c(year, quarter))
+# 
+# ggplot(nd) +
+#   geom_line(aes(year, exp(pred_m0_1))) +
+#   geom_line(data = dmean |> filter(quarter == 3),
+#             aes(year, mean), color = "blue") +
+#   geom_line(data = dmean |> filter(quarter == 1),
+#             aes(year, mean), color = "green") +
+#   geom_line(aes(year, exp(pred_m0b_1)), color = "red") +
+#   geom_line(aes(year, exp(pred_mrw)), color = "grey")
+# 
+# newdat <- nd |> filter(year == 2000)
+# 
+# pred_m0  <- predict(m0,  newdata = newdat, type = "response")$est  # AR1 model
+# pred_m0b <- predict(m0b, newdata = newdat, type = "response")$est  # fixed-year model
+# 
+# data.frame(model = c("m0 (AR1)", "m0b (year_f)"), pred = c(pred_m0, pred_m0b))
+```
+
+Initial exploration suggests the spatiotemporal random field for the binomial model is estimated very small, hence it's omitted here and only applies to the gamma component.
 
 ```{r}
 # Spatiotemporal instead?
-library(tictoc)
 tic()
 m1 <- sdmTMB(
-  formula = density ~ year_f + s(depth_sc) + quarter_f + temp_sc,
+  formula = density ~ s(depth_sc) + temp_sc + quarter_f,
   data = d,
   mesh = mesh,
-  family = delta_gamma(),
-  spatiotemporal = list("off", "IID"),
+  family = delta_gamma(type = "poisson-link"),
+  time_varying = ~1,
+  time_varying_type = "ar1",
+  spatiotemporal = list("off", "iid"),
   spatial = "on",
   time = "year")
 toc()
@@ -122,10 +231,103 @@ toc()
 sanity(m1)
 ```
 
-AIC favours the spatiotemporal model
+```{r}
+# Spatiotemporal but squared depth
+tic()
+m2 <- sdmTMB(
+  formula = density ~ depth_sc + depth_sq + temp_sc + quarter_f,
+  data = d,
+  mesh = mesh,
+  family = delta_gamma(type = "poisson-link"),
+  time_varying = ~1,
+  time_varying_type = "ar1",
+  spatiotemporal = list("off", "iid"),
+  spatial = "on",
+  time = "year")
+toc()
+
+sanity(m2)
+```
 
 ```{r}
-AIC(m0, m1)
+# Spatiotemporal but squared depth for binomial and linear for gamma
+tic()
+m3 <- sdmTMB(
+  formula = list(density ~ depth_sc + depth_sq + temp_sc + quarter_f,
+                 density ~ depth_sc + temp_sc + quarter_f),
+  data = d,
+  mesh = mesh,
+  family = delta_gamma(type = "poisson-link"),
+  time_varying = ~1,
+  time_varying_type = "ar1",
+  spatiotemporal = list("off", "iid"),
+  spatial = "on",
+  time = "year")
+toc()
+
+sanity(m3)
+```
+
+```{r}
+# Spatiotemporal ar1 and squared depth for binomial and linear for gamma
+tic()
+m4 <- sdmTMB(
+  formula = list(density ~ depth_sc + depth_sq + temp_sc + quarter_f,
+                 density ~ depth_sc + temp_sc + quarter_f),
+  data = d,
+  mesh = mesh,
+  family = delta_gamma(type = "poisson-link"),
+  time_varying = ~1,
+  time_varying_type = "ar1",
+  spatiotemporal = list("off", "ar1"),
+  spatial = "on",
+  time = "year")
+toc()
+
+sanity(m4)
+```
+
+```{r}
+# Spatiotemporal ar1 and squared depth for binomial and linear for gamma, allow spatial fields to vary with quarter?
+tic()
+m5 <- sdmTMB(
+  formula = list(density ~ depth_sc + depth_sq + temp_sc + quarter_f,
+                 density ~ depth_sc + temp_sc + quarter_f),
+  data = d,
+  mesh = mesh,
+  family = delta_gamma(type = "poisson-link"),
+  time_varying = ~1,
+  time_varying_type = "ar1",
+  spatiotemporal = list("off", "ar1"),
+  spatial = "off",
+  spatial_varying = ~ 0 + quarter_f,
+  time = "year")
+toc()
+
+tidy(m5, effects = "ran_pars")
+
+sanity(m5)
+```
+
+AIC favors the spatiotemporal model, with different fields and formula for each component
+
+```{r}
+AIC(m0, m1, m2, m3, m4, m5)
+```
+
+```{r}
+dd <- d |> 
+  mutate(res_m5 = residuals(m5),
+         res_m0 = residuals(m0)) |> 
+  pivot_longer(c(res_m5, res_m0))
+
+ggplot() +
+  geom_jitter(data = dd |> drop_na(value),
+              aes(X, Y, color = value),
+              width = 6, height = 6, size = 1, alpha = 1) +
+  scale_color_gradient2() + 
+  facet_wrap(~name) + 
+  theme(legend.position = "bottom")
 ```
 
 Check model fit. The spatiotemporal model also yields better QQ plots
@@ -134,45 +336,75 @@ Check model fit. The spatiotemporal model also yields better QQ plots
 #| message: false
 #| warning: false
 
-d$Binomial <- residuals(m1, model = 1)
-d$Gamma <- residuals(m1, model = 2)
+res <- simulate(m5, nsim = 400, type = "mle-mvn") |>
+  dharma_residuals(m5)
 
-d %>% 
-  pivot_longer(c(Binomial, Gamma)) %>% 
-  ggplot(aes(sample = value)) +
-  stat_qq(size = 0.75, shape = 21, fill = NA) +
-  stat_qq_line() +
-  facet_wrap(~name) + 
-  labs(y = "Sample Quantiles", x = "Theoretical Quantiles") +
-  theme(aspect.ratio = 1)
+ggplot(res, aes(observed, expected)) +
+  geom_point(color = "grey30", shape = 21) +
+  geom_abline(col = "tomato3", linewidth = 1.2) +
+  theme(aspect.ratio = 1) +
+  labs(x = "Observed", y = "Expected")
 ```
 
 ## Conditional effects
-Initial exploration also suggests that depth should be modelled on the log scale. A smooth effect works nicely for the binomial part, but it can be questioned whether depth affects the biomass density at all. However, currently in delta models in sdmTMB, if using smoothers, the effect needs to shared among model components. We could circumvent this by providing different formulas in a list, say e.g., as linear and quadratic effect. But this works ok for now. It's just a very uncertain effect. The temperature effects are very strong and very linear!
 
 ```{r}
 #| message: false
 #| fig-height: 8
 
+# First check coefficients
+tidy(m5, exponentiate = TRUE) |> 
+  as.data.frame()
+
 # Depth
-p1 <- visreg_delta(m1, xvar = "depth_sc", model = 1, gg = TRUE) + 
-  labs(x = "Scaled depth", title = "Binomial") 
+# Manual depth prediction
+nd_depth <- tibble(depth = modelr::seq_range(d$depth, n = 50)) |> 
+  mutate(temp_sc = 0, 
+         depth_sc = as.numeric(scale(depth)),
+         depth_sq = depth_sc*depth_sc,
+         quarter_f = as.factor(3),
+         year = 1999,
+         year_f = as.factor(1999))
 
-p2 <- visreg_delta(m1, xvar = "depth_sc", model = 2, gg = TRUE) +
-  labs(x = "Scaled depth", title = "Gamma")
+p_depth <- predict(m5, newdata = nd_depth, re_form = NA, re_form_iid = NA)
 
-p1 / p2 + 
-  plot_layout(axes = "collect")
+ggplot(p_depth, aes(depth, est1)) + 
+  geom_line() + 
+  geom_point(data = d, aes(depth, log(density)))
 
-# Temperature
-p3 <- visreg_delta(m1, xvar = "temp_sc", model = 1, gg = TRUE) +
-  labs(x = "Scaled temperature", title = "Binomial")
+ggplot(p_depth, aes(depth, est2)) + 
+  geom_line() + 
+  geom_point(data = d, aes(depth, log(density)))
 
-p4 <- visreg_delta(m1, xvar = "temp_sc", model = 2, gg = TRUE) +
-  labs(x = "Scaled temperature", title = "Gamma")
+ggplot(p_depth, aes(depth, est)) + 
+  geom_line() + 
+  geom_point(data = d, aes(depth, log(density)))
 
-p3 / p4 +
-  plot_layout(axes = "collect")
+# Manual temperature prediction
+nd_temp <- tibble(temp = modelr::seq_range(d$temp, n = 50)) |> 
+  mutate(temp_sc = as.numeric(scale(temp)),
+         depth_sc = 0,
+         depth_sq = depth_sc*depth_sc,
+         quarter_f = as.factor(3),
+         year = 1999,
+         year_f = as.factor(1999))
+
+p_temp <- predict(m5, newdata = nd_temp, re_form = NA, re_form_iid = NA)
+
+ggplot(p_temp, aes(temp, est1)) + 
+  geom_line() + 
+  geom_point(data = d, aes(temp, log(density)))
+
+ggplot(p_temp, aes(temp, est2)) + 
+  geom_line() + 
+  geom_point(data = d, aes(temp, log(density)))
+
+ggplot(p_temp, aes(temp, est)) + 
+  geom_line()
+
+# FIXME interesting that temperature is so negative?!
+# Also should I try non linear?
+# see how I can plot this nicer with data
 ```
 
 ## Spatial predictions
@@ -181,15 +413,19 @@ p3 / p4 +
 #| message: false
 #| warning: false
 
-pred <- predict(m1, newdata = pred_grid, type = "response")
+pred <- predict(m5, newdata = pred_grid)
 
 # Spatial random
 p1 <- plot_map +
-  geom_raster(data = pred %>% filter(year == max(year)),
-              aes(X*1000, Y*1000, fill = omega_s1)) +
+  geom_raster(data = pred |>
+                filter(year == max(year)) |> 
+                pivot_longer(c(zeta_s_quarter_f11, zeta_s_quarter_f31),
+                             names_to = "name2"),
+              aes(X*1000, Y*1000, fill = value)) +
   scale_fill_gradient2(name = "Spatial random effect") +
+  facet_wrap(~ name2) +
   theme_sleek(base_size = 9) +
-  theme(legend.position.inside = c(0.25, 0.1),
+  theme(legend.position.inside = c(0.12, 0.08),
         legend.direction = "horizontal",
         legend.key.width = unit(0.7, "cm"),
         legend.key.height = unit(0.3, "cm")) +
@@ -199,12 +435,18 @@ p1 <- plot_map +
   geom_sf() +
   labs(subtitle = "Binomial")
 
+p1
+
 p2 <- plot_map +
-  geom_raster(data = pred %>% filter(year == max(year)),
-              aes(X*1000, Y*1000, fill = omega_s2)) +
+  geom_raster(data = pred |>
+                filter(year == max(year)) |> 
+                pivot_longer(c(zeta_s_quarter_f12, zeta_s_quarter_f32),
+                             names_to = "name2"),
+              aes(X*1000, Y*1000, fill = value)) +
   scale_fill_gradient2(name = "Spatial random effect") +
+  facet_wrap(~ name2) +
   theme_sleek(base_size = 9) +
-  theme(legend.position.inside = c(0.25, 0.1),
+  theme(legend.position.inside = c(0.12, 0.08),
         legend.direction = "horizontal",
         legend.key.width = unit(0.7, "cm"),
         legend.key.height = unit(0.3, "cm")) +
@@ -214,7 +456,7 @@ p2 <- plot_map +
   geom_sf() +
   labs(subtitle = "Gamma")
 
-p1 + p2
+p1 / p2
 ```
 
 ## Spatiotemporal predictions
@@ -226,10 +468,10 @@ p1 + p2
 
 # Total predictions
 plot_map_fc +
-  geom_raster(data = pred %>% filter(quarter_f == "1"),
-              aes(X*1000, Y*1000, fill = est)) +
+  geom_raster(data = pred,
+              aes(X*1000, Y*1000, fill = exp(epsilon_st2))) +
   scale_fill_viridis(name = "Density (kg/km2)", trans = "sqrt") +
-  facet_wrap(~year, ncol = 5) +
+  facet_wrap(~year, ncol = 7) +
   theme_sleek(base_size = 9) +
   theme(legend.position.inside = c(0.195, 0.75),
         legend.direction = "vertical",
@@ -243,13 +485,36 @@ plot_map_fc +
     title.hjust = 1, 
     theme = theme(legend.key.width  = unit(3, "cm")))) + 
   geom_sf() + 
-  labs(subtitle = "Quarter 1")
+  labs(subtitle = "Quarter 3")
 
+# Total predictions
 plot_map_fc +
-  geom_raster(data = pred %>% filter(quarter_f == "3"),
-              aes(X*1000, Y*1000, fill = est)) +
+  geom_raster(data = pred,
+              aes(X*1000, Y*1000, fill = exp(est1 + est2))) +
   scale_fill_viridis(name = "Density (kg/km2)", trans = "sqrt") +
-  facet_wrap(~year, ncol = 5) +
+  facet_wrap(~year, ncol = 7) +
+  theme_sleek(base_size = 9) +
+  theme(legend.position.inside = c(0.195, 0.75),
+        legend.direction = "vertical",
+        legend.key.width = unit(0.2, "cm"),
+        legend.key.height = unit(0.3, "cm"),
+        legend.title = element_text(size = 6)) +
+  guides(fill = guide_colorbar(
+    position = "bottom", 
+    title.position = "top",
+    direction = "horizontal",
+    title.hjust = 1, 
+    theme = theme(legend.key.width  = unit(3, "cm")))) + 
+  geom_sf() + 
+  labs(subtitle = "Quarter 3")
+
+# Select years
+plot_map_fc +
+  geom_raster(data = pred |> 
+                filter(year %in% c(1993, 2003, 2013, 2023)),
+              aes(X*1000, Y*1000, fill = exp(est1 + est2))) +
+  scale_fill_viridis(name = "Density (kg/km2)", trans = "sqrt") +
+  facet_wrap(~year, ncol = 2) +
   theme_sleek(base_size = 9) +
   theme(legend.position.inside = c(0.195, 0.75),
         legend.direction = "vertical",
@@ -266,51 +531,78 @@ plot_map_fc +
   labs(subtitle = "Quarter 3")
 ```
 
-Select a few years and plot quarters next to each other
-
-```{r}
-plot_map_fc +
-  geom_raster(data = pred %>%
-                filter(year %in% c(1993, 2001, 2020)),
-              aes(X*1000, Y*1000, fill = est)) +
-  scale_fill_viridis(name = "Density (kg/km2)", trans = "sqrt") +
-  facet_grid(quarter~year) +
-  theme_sleek(base_size = 9) +
-  theme(legend.position.inside = c(0.195, 0.75),
-        legend.direction = "vertical",
-        legend.key.width = unit(0.2, "cm"),
-        legend.key.height = unit(0.3, "cm"),
-        legend.title = element_text(size = 6)) +
-  guides(fill = guide_colorbar(position = "bottom", 
-    title.position = "top",
-    direction = "horizontal",
-    title.hjust = 1, 
-    theme = theme(legend.key.width  = unit(3, "cm")))) + 
-  geom_sf()
-```
-
 ## Plot area occupied over time
-Here we rather arbitrarily chose a threshold of 50% to mean presence. A higher value yields too many years with no predictions for Q1. We predict this from the binomial component of the model. Note that the increase is very steep in Q3, which also has warmed more.
 
 ```{r}
 #| warning: false
 #| message: false
 
-# Here simply defined as grids with >50% probability of occurrence
-n_cells <- pred %>% filter(quarter == 1) %>% nrow()
+# For get_eao(): A data frame with a columns for time, estimate (effective area occupied; EAO), lower and upper confidence intervals, log EAO, and standard error of the log EAO estimates.
+# Thorson, J.T., Rindorf, A., Gao, J., Hanselman, D.H., and Winker, H. 2016. Density-dependent changes in effective area occupied for sea-bottom-associated marine fishes. Proceedings of the Royal Society B: Biological Sciences 283(1840): 20161853. doi:10.1098/rspb.2016.1853
+# ‘effective area occupied’ measures the area (in units square km) required to contain a population given its average population density (kg/km2).
 
-pred %>% 
-  mutate(presence = ifelse(est1 > 0.5, 1, 0)) %>% 
-  summarise(n = sum(presence), .by = c(year, quarter)) %>% 
-  mutate(prop = (n / n_cells) * 100) %>% 
-  ggplot(aes(year, prop, color = factor(quarter), fill = factor(quarter))) + 
+pred_tmb_q3 <- predict(
+  m5,
+  newdata = pred_grid |> filter(quarter == 3),
+  return_tmb_object = TRUE)
+
+eao_q3 <- get_eao(pred_tmb_q3, area = 9) |> 
+  mutate(quarter = 3)
+
+pred_tmb_q1 <- predict(
+  m5,
+  newdata = pred_grid |> filter(quarter == 1),
+  return_tmb_object = TRUE)
+
+eao_q1 <- get_eao(pred_tmb_q1, area = 9) |> 
+  mutate(quarter = 1)
+
+eao <- bind_rows(eao_q3, eao_q1)
+
+eao |> 
+  ggplot(aes(year, est, color = as.factor(quarter))) + 
   geom_point() +
-  scale_fill_brewer(palette = "Set1") +
-  scale_color_brewer(palette = "Set1") +
-  labs(color = "Quarter", fill = "Quarter", x = "Year",
-       y = "% of cells with probability of occurence > 50%") +
-  geom_smooth(method = "gam", formula = y~s(x, k = 20)) + 
-  theme(legend.position = "bottom")
+  labs(y = "Effective area occupied (km<sup>2</sup>)",
+       x = "Year") +
+  geom_smooth(method = "gam", formula = y~s(x, k = 6)) + 
+  scale_color_brewer(palette = "Dark2") +
+  theme(axis.title.y = element_markdown())
+
+# FIXME: I think many predictions depend on interaction between quarter and not
+# FIXME: not sure about thorsons metric works... maybe compare to heatmap, where x is year, y is probability of occurence, and heat/fill is number of cells above that probability
+
+
+dlist <- list()
+
+for(i in seq(0.05, 1, by = 0.05)){
+
+  t <- pred |>
+    summarise(prop = mean(exp(est1) > i),
+              .by = c(quarter, year))
+  
+  dlist[[as.character(i)]] <- t |> mutate(prob = i)
+
+}
+
+heat <- bind_rows(dlist)
+
+heat |> 
+  filter(prob > 0) |> 
+  ggplot(aes(x = year, y = prob, fill = prop)) +
+  geom_raster() +
+  facet_wrap(~quarter) + 
+  scale_fill_viridis(option = "rocket") +
+  labs(
+    x = "Year",
+    y = "Probability of occurence, *p*",
+    fill = "Proportion cells above *p*"
+  ) +
+  theme(aspect.ratio = 1,
+        axis.title = element_markdown(),
+        legend.title = element_markdown()) +
+  coord_cartesian(expand = 0)
+
+thresholds <- seq(0.05, 1, by = 0.05)
 ```
 
 ### Get index over time
@@ -319,32 +611,63 @@ pred %>%
 #| warning: false
 #| message: false
 
-pred_q1 <- predict(m1, newdata = pred_grid %>% filter(quarter == 1),
-                   return_tmb_object = TRUE)
+#FIXME there's a spike in the index
+# I think it's because in year 2000 i dont have q3 data. but i only have ar1 on the gamma model. so uncertainty is very large
 
-pred_q3 <- predict(m1, newdata = pred_grid %>% filter(quarter == 3),
-                   return_tmb_object = TRUE)
-
-index_q1 <- get_index(pred_q1, area = 9, bias_correct = FALSE)
-index_q3 <- get_index(pred_q3, area = 9, bias_correct = FALSE)
-
-index <- bind_rows(index_q1 %>% mutate(quarter = as.factor(1)),
-                   index_q3 %>% mutate(quarter = as.factor(3)))
+index_q3 <- get_index(pred_tmb_q3, area = 9, bias_correct = TRUE, level = 0.95)
 
 # Mean in data
-d %>% 
-  summarise(dens = mean(density), .by = c(year, quarter)) %>% 
+d |> 
+  summarise(dens = mean(density), .by = c(quarter, year)) |> 
   ggplot(aes(year, dens, color = as.factor(quarter))) + 
   geom_line() +
   scale_color_brewer(palette = "Set1", name = "Quarter") +
-  theme(legend.position = "bottom") +
+  theme(legend.position = "bottom",
+        axis.title.y = element_markdown()) +
   labs(subtitle = "Mean density in data",
-       x = "Year", y = "Density (kg/km2)")
-  
+       x = "Year", y = "Biomass density (kg/km<sup>2</sup>)")
+
 # Index
-ggplot(index, aes(year, est/1000, color = quarter, fill = quarter)) +
+ggplot(index_q3, aes(year, est/1000)) +
   geom_ribbon(aes(ymin = lwr/1000, ymax = upr/1000), alpha = 0.3, color = NA) +
   geom_line() +
+  scale_color_brewer(palette = "Set1") + 
+  scale_fill_brewer(palette = "Set1") +
+    labs(subtitle = "Spatiotemporal index", color = "Quarter",
+         fill = "Quarter", x = "Year", y = "Biomass estimate (tonnes)")
+```
+
+## What if we add m0 index here? And the factor year?
+
+```{r}
+m5b <- sdmTMB(
+  formula = list(density ~ year_f + depth_sc + depth_sq + temp_sc + quarter_f,
+                 density ~ year_f + depth_sc + temp_sc + quarter_f),
+  data = d,
+  mesh = mesh,
+  family = delta_gamma(type = "poisson-link"),
+  spatiotemporal = list("off", "ar1"),
+  spatial = "off",
+  spatial_varying = ~ 0 + quarter_f,
+  time = "year")
+
+pred_tmb_q3_m5b <- predict(
+  m5b,
+  newdata = pred_grid |> filter(quarter == 3),
+  return_tmb_object = TRUE)
+
+index_q3_m5b <- get_index(pred_tmb_q3_m5b, area = 9, bias_correct = TRUE, level = 0.95)
+
+ind_comp <- bind_rows(
+  index_q3 |> mutate(model = "m5"),
+  index_q3_m5b |> mutate(model = "m5b")
+)
+
+ggplot(ind_comp,
+       aes(year, est/1000, fill = model, color = model)) +
+  geom_ribbon(aes(ymin = lwr/1000, ymax = upr/1000), alpha = 0.3, color = NA) +
+  geom_line() +
+  scale_y_continuous(trans = "sqrt") +
   scale_color_brewer(palette = "Set1") + 
   scale_fill_brewer(palette = "Set1") +
     labs(subtitle = "Spatiotemporal index", color = "Quarter",
@@ -354,8 +677,8 @@ ggplot(index, aes(year, est/1000, color = quarter, fill = quarter)) +
 ## For ROM
 
 ```{r}
-index %>% 
-  filter(quarter == 3) %>% 
+## Index plot
+index_q3 |> 
   ggplot(aes(year, est/1000)) +
   theme_aqua() +
   scale_x_continuous(expand = c(0, 0), breaks = scales::pretty_breaks(n = 6)) +
@@ -364,9 +687,9 @@ index %>%
   geom_line() +
   labs(x = "", y = "Biomassaindex (ton)")
 
-ggsave(paste0(home, "/figures/fiskbarometern/Fig_3_maxlindmark.png"), dpi = 300, width = 8, height = 8, units = "cm")
+ggsave(paste0(home, "/figures/fiskbarometern/Fig_3_maxlindmark.png"),
+       dpi = 300, width = 8, height = 8, units = "cm")
 ```
-
 
 ## What are the temperature trends over time? And how do they relate to the index?
 
@@ -374,111 +697,99 @@ ggsave(paste0(home, "/figures/fiskbarometern/Fig_3_maxlindmark.png"), dpi = 300,
 #| message: false
 #| fig-height: 8
 
-pred_grid %>% 
-  summarise("Mean temperature" = mean(temp), .by = c(year, quarter_f)) %>% 
-  ggplot(aes(year, `Mean temperature`, color = quarter_f)) + 
-  geom_line() +
-  labs(x = "Year") + 
-  facet_wrap(~quarter_f, scales = "free", ncol = 1) +
-  scale_color_brewer(palette = "Set1") + 
-  guides(color = "none")
+index_q1 <- get_index(pred_tmb_q1, area = 9, bias_correct = TRUE, level = 0.95)
 
-mean_temps <- pred_grid %>%
-  summarise("Mean temperature" = mean(temp), .by = c(year, quarter_f)) %>% 
-  rename(quarter = quarter_f)
-```
+index <- bind_rows(index_q1 |> mutate(quarter = 1),
+                   index_q3 |> mutate(quarter = 3))
 
-```{r}
-#| message: false
+eao_dat <- left_join(index,
+                 eao |>
+                   rename(EAO = est,
+                          lwr_e = lwr,
+                          upr_e = upr) |>
+                   dplyr::select(year, quarter, EAO, lwr_e, upr_e),
+                 by = c("year", "quarter")) |> 
+  rename(Tonnes = est)
 
-index_temp <- index %>%
-  left_join(mean_temps, by = c("year", "quarter"))
-  
-index_temp %>% 
-  rename(Tonnes = est) %>% 
-  ggplot(aes(`Mean temperature`, Tonnes)) + 
-  geom_point() +
-  theme(aspect.ratio = 1) + 
-  facet_wrap(~quarter, scales = "free")
-```
-
-Calculate z-scores and plot over time
-
-```{r}
-#| message: false
-#| fig-height: 8
-
-index_temp %>% 
-  rename(Tonnes = est) %>% 
-  dplyr::select(year, Tonnes, quarter, `Mean temperature`) %>% 
-  pivot_longer(c(Tonnes, `Mean temperature`)) %>% 
-  mutate(z = (value - mean(value)) / sd(value), .by = c("name", "quarter")) %>% 
-  ggplot(aes(year, z, color = name)) + 
-  geom_line() +
-  labs(color = "", x = "Year") +
-  scale_color_brewer(palette = "Set1") + 
-  facet_wrap(~quarter, scales = "free", ncol = 1) + 
-  theme(legend.position = "bottom")
-```
-
-## Now compare an index for the full time series (without temperature)
-
-```{r}
-#| message: false
-d2 <- readr::read_csv(paste0(home, "/data/clean/trawl.csv")) %>% 
-  filter(depth > 0) %>% 
-  mutate(depth = log(depth), 
-         depth_sc = as.numeric(scale(depth)),
-         depth_sq = depth_sc*depth_sc,
-         quarter_f = as.factor(quarter),
-         year_f = as.factor(year))
-
-# Read prediction grid
-pred_grid2 <- readr::read_csv(paste0(home, "/data/clean/pred_grid.csv")) %>% 
-  filter(depth > 0) %>% 
-  mutate(depth = log(depth),
-         depth_sc = (depth - mean(d$depth)) / sd(d$depth),
-         depth_sq = depth_sc*depth_sc,
-         quarter_f = as.factor(quarter),
-         year_f = as.factor(year))
-
-mesh <- make_mesh(d2,
-                  xy_cols = c("X", "Y"),
-                  cutoff = 4)
-
-m2 <- sdmTMB(
-  formula = density ~ year_f + s(depth_sc) + quarter_f,
-  data = d2,
-  mesh = mesh,
-  family = delta_gamma(),
-  spatiotemporal = list("off", "IID"),
-  spatial = "on",
-  time = "year")
-
-sanity(m2)    
-
-pred2_q1 <- predict(m2, newdata = pred_grid2 %>% filter(quarter == 1),
-                    return_tmb_object = TRUE)
-
-pred2_q3 <- predict(m2, newdata = pred_grid2 %>% filter(quarter == 3),
-                    return_tmb_object = TRUE)
-
-index2_q1 <- get_index(pred2_q1, area = 9, bias_correct = FALSE)
-index2_q3 <- get_index(pred2_q3, area = 9, bias_correct = FALSE)
-
-index2 <- bind_rows(index2_q1 %>% mutate(quarter = as.factor(1)),
-                    index2_q3 %>% mutate(quarter = as.factor(3)))
-
-# Index
-ggplot(bind_rows(index2 %>% mutate(series = "long"),
-                 index %>% mutate(series = "temp")),
-       aes(year, est/1000, color = series, fill = series)) +
-  #geom_ribbon(aes(ymin = lwr/1000, ymax = upr/1000), alpha = 0.3, color = NA) +
-  geom_line() +
+# Now area occupied
+p1 <- eao_dat |>
+  ggplot(aes(Tonnes, EAO)) +
+  geom_point(alpha = 0.8, size = 2) +
+  # geom_smooth(method = "gam", formula = y~s(x, k = 3), alpha = 0.5, color = "steelblue") +
+  # geom_errorbar(aes(ymin = lwr, ymax = upr), alpha = 0.2) +
+  # geom_errorbar(aes(xmin = lwr_e, xmax = upr_e), alpha = 0.2) +
   facet_wrap(~quarter, scales = "free") +
-  scale_color_brewer(palette = "Set1") + 
-  scale_fill_brewer(palette = "Set1") +
-  labs(subtitle = "Spatiotemporal index", color = "Quarter",
-       fill = "Quarter", x = "Year", y = "Biomass estimate (tonnes)")
+  theme_sleek(base_size = 18) +
+  theme(aspect.ratio = 1,
+        axis.title.x = element_blank())
+
+p1
+
+# No do number of grid cells above 90% probs
+heat_dat <- heat |> 
+  filter(prob > 0.86 & prob < 0.94) |> 
+  left_join(index |>
+              dplyr::select(year, est, quarter) |> 
+              rename(Tonnes = est))
+
+# TODO: I should get uncertainty on the prop with sims... in that case maybe do sims for all metrics?
+
+p2 <- heat_dat |>
+  ggplot(aes(Tonnes, prop)) +
+  geom_point(alpha = 0.8, size = 2) +
+  labs(y = "Proportion inhabited") +
+  # geom_smooth(method = "gam", formula = y~s(x, k = 3), alpha = 0.5, color = "steelblue") +
+  # geom_errorbar(aes(ymin = lwr, ymax = upr), alpha = 0.2) +
+  # geom_errorbar(aes(xmin = lwr_e, xmax = upr_e), alpha = 0.2) +
+  facet_wrap(~quarter, scales = "free") +
+  theme_sleek(base_size = 18) +
+  theme(aspect.ratio = 1)
+
+(p1 / p2)
+
+
+# eao_temp |>
+#   rename(Tonnes = est) |>
+#   dplyr::select(year, Tonnes, eao) |>
+#   pivot_longer(c(Tonnes, eao)) |>
+#   mutate(z = (value - mean(value)) / sd(value), .by = name) |>
+#   ggplot(aes(year, z, color = name)) +
+#   geom_line() +
+#   labs(color = "", x = "Year") +
+#   scale_color_brewer(palette = "Set1") +
+#   theme(legend.position = "bottom")
+
+# pred_grid |> 
+#   summarise("Mean temperature" = mean(temp), .by = c(year)) |> 
+#   ggplot(aes(year, `Mean temperature`)) + 
+#   geom_line() +
+#   labs(x = "Year") + 
+#   scale_color_brewer(palette = "Set1") + 
+#   guides(color = "none")
+# 
+# mean_temps <- pred_grid |>
+#   summarise("Mean temperature" = mean(temp), .by = c(year))
+#
+# index_temp <- index |>
+#   left_join(mean_temps, by = c("year"))
+# 
+# index_temp |> 
+#   rename(Tonnes = est) |> 
+#   ggplot(aes(`Mean temperature`, Tonnes)) + 
+#   geom_point() +
+#   theme(aspect.ratio = 1)
+# 
+# # Calculate z-scores and plot over time
+# index_temp |> 
+#   rename(Tonnes = est) |> 
+#   dplyr::select(year, Tonnes, `Mean temperature`) |> 
+#   pivot_longer(c(Tonnes, `Mean temperature`)) |> 
+#   mutate(z = (value - mean(value)) / sd(value), .by = name) |> 
+#   ggplot(aes(year, z, color = name)) + 
+#   geom_line() +
+#   labs(color = "", x = "Year") +
+#   scale_color_brewer(palette = "Set1") + 
+#   theme(legend.position = "bottom")
+# 
 ```
 

@@ -37,36 +37,32 @@ library(tidync)
 library(ggsidekick); theme_set(theme_sleek())
 
 home <- here::here()
-
-# Load all custom functions in R/function
-# - map-plot [source_url("https://raw.githubusercontent.com/maxlindmark/cod-interactions/main/R/functions/map-plot.R")]
-# - callCopernicusCovariate
-# - extractCovariateAtLocation
-for(fun in list.files(paste0(home, "/R/functions"))){
-  source(paste(home, "R/functions", fun, sep = "/"))
-}
 ```
 
 ## Read and prepare data
 
 ```{r}
-d <- read.csv(paste0(home, "/data/Trawl Surveys Zincl (L).csv"), sep = ";", dec = ",") %>% 
-  janitor::clean_names() %>% 
-  filter(subdiv <= 21) %>% 
-  filter(validity == "V") %>% 
-  mutate(haul_id = paste(year, quarter, month, haul)) %>% 
-  mutate(median_swept = median(swept_area, na.rm = TRUE), .by = year) %>%
+d <- read.csv(paste0(home, "/data/Trawl Surveys Zincl (L)_2026.csv"), sep = ";", dec = ",") |> 
+  janitor::clean_names() |> 
+  filter(subdiv <= 21) |> 
+  filter(validity == "V") |> 
+  mutate(haul_id = paste(year, quarter, month, haul)) |> 
+  # New names from 2025
+  rename(swept_area = swept_area_km2,
+         duration = duration_min) |> 
+  mutate(median_swept = median(swept_area, na.rm = TRUE), .by = year) |>
   mutate(swept_area = ifelse(is.na(swept_area), median_swept, swept_area),
          kg_hour = replace_na(kg_hour, 0),
          kg = kg_hour * (duration / 60),
-         density = kg / swept_area) %>% 
-  distinct(haul_id, .keep_all = TRUE) %>% 
-  filter(density < quantile(density, probs = 0.999)) %>% 
-  dplyr::select(date, year, quarter, month, subdiv, lat, long, density) %>% 
+         density = kg / swept_area) |> 
+  distinct(haul_id, .keep_all = TRUE) |> 
+  mutate(upr_cut = quantile(density, probs = 0.995, na.rm = TRUE), .by = quarter) |> 
+  filter(density < upr_cut) |> 
+  dplyr::select(date, year, quarter, month, subdiv, lat, long, density) |> 
   mutate(lat = floor(lat/100)+(lat-100*floor(lat/100))/60,
          lon = floor(long/100)+(long-100*floor(long/100))/60,
          lat = ifelse(lat<0,-1*lat,lat),
-         lon = ifelse(long<0,-1*lon,lon)) %>% 
+         lon = ifelse(long<0,-1*lon,lon)) |> 
   add_utm_columns(ll_names = c("lon", "lat"))
 ```
 
@@ -79,69 +75,140 @@ depth_box <- getNOAA.bathy(min(d$lon) - .1, max(d$lon) + .1, min(d$lat)  - .1, m
 d$depth <- get.depth(depth_box, x=d$lon, y=d$lat, locator=F)$depth*(-1)
 ```
 
+```{r}
+d %>% 
+  filter(year < 2011) |> 
+  filter(!quarter == 1) |> 
+  arrange(desc(density))
+
+# TEST
+d %>% 
+  filter(year < 2022) |> 
+  summarise(dens = mean(density), .by = c(year, quarter)) %>% 
+  ggplot(aes(year, dens, color = as.factor(quarter))) + 
+  geom_line() +
+  scale_color_brewer(palette = "Set1", name = "Quarter") +
+  theme(legend.position = "bottom") +
+  labs(subtitle = "Mean density in data",
+       x = "Year", y = "Density (kg/km2)")
+```
+
 Add temperature
 
 ```{r}
-covPath <- paste0(home, "/data/covariates")
+# SBT? 
+# https://data.marine.copernicus.eu/product/GLOBAL_MULTIYEAR_PHY_001_030/description
+# d <- d |>
+#   filter(year >= 1993) |> 
+#   mutate(year_month = paste(year, month, sep = "_"))
+# 
+# read_trim_nc <- function(file_path){
+#   
+#   tidync(file_path) |>
+#     hyper_tibble() |>
+#     mutate(date = as.Date(as.POSIXct(time, origin = "1970-01-01")),
+#            year = year(date),
+#            month = month(date),
+#            day = day(date),
+#            year = year(date),
+#            year_month = paste(year, month, sep = "_")) |> 
+#     rename(lon = longitude,
+#            lat = latitude,
+#            temp = bottomT) |> 
+#     filter(year_month %in% c(unique(d$year_month)) & day == 1 & lon > 7 & lon < 15 & lat > 54 & lat < 61)
+# }
+# 
+# print(
+#   nc_open(paste0(home, "/data/covariates/sbt/cmems_mod_glo_phy_my_0.083deg_P1D-m_1758698322450.nc")))
+# 
+# st_tibble5 <- read_trim_nc(
+#   paste0(home, "/data/covariates/sbt/cmems_mod_glo_phy_my_0.083deg_P1D-m_1758698322450.nc"))
+# 
+# ggplot() +
+#   geom_raster(data = st_tibble5, aes(lon, lat, fill = temp)) +
+#   facet_wrap(~year)
+# 
+# # Loop through all year/month combos, extract the temperatures at the data locations
+# temp_list <- list()
+# 
+# for (i in unique(d$year_month)) {
+#   d_sub <- filter(d, year_month == i)
+#   temp_tibble_sub <- filter(st_tibble5, year_month == i)
+# 
+#   # Convert to raster
+#   temp_raster <- as_spatraster(temp_tibble_sub,
+#     xycols = 2:3,
+#     crs = "WGS84", digits = 3
+#   )
+# 
+#   # Extract from raster
+#   d_sub$temp <- terra::extract(
+#     temp_raster$temp,
+#     d_sub |> dplyr::select(lon, lat)
+#   )$thetao
+# 
+#   # Save
+#   temp_list[[i]] <- d_sub
+# }
+# 
+# d_temp <- bind_rows(temp_list)
+```
 
-# Source: https://data.marine.copernicus.eu/product/GLOBAL_MULTIYEAR_PHY_001_030/download?dataset=cmems_mod_glo_phy_my_0.083deg_P1M-m_202311
-# Print details
-print(nc_open(paste(covPath, "sst", "cmems_mod_glo_phy_my_0.083deg_P1M-m_1715939377383.nc", sep = "/")))
+```{r}
+# New approach based on ensemble forecast
+d <- d |>
+  filter(year >= 1993) |> 
+  mutate(year_month = paste(year, month, sep = "_"))
 
-temp_tibble <- tidync(paste(covPath, "sst",
-                            "cmems_mod_glo_phy_my_0.083deg_P1M-m_1715939377383.nc", sep = "/")) %>%
-  hyper_tibble() %>% 
-  mutate(date = as_datetime(time, origin = '1970-01-01')) %>%
-  mutate(month = month(date),
-         day = day(date),
-         year = year(date),
-         quarter = ifelse(month %in% c(1:3), 1, NA),
-         quarter = ifelse(month %in% c(7:9), 3, quarter)) %>% 
-  filter(quarter %in% c(1, 3)) %>% 
-  mutate(year_q = paste(year, quarter, sep = "_"))
+read_trim_nc <- function(file_path){
+  
+  tidync(file_path) |>
+    hyper_tibble() |>
+    mutate(date = as.Date(time, origin = "1993-01-01"),
+           year = year(date),
+           month = month(date),
+           day = day(date),
+           year = year(date),
+           year_month = paste(year, month, sep = "_")) |> 
+    filter(year_month %in% c(unique(d$year_month)) & day == 1 & lon > 7 & lon < 15 & lat > 54 & lat < 61 & percentiles == 50)
+}
 
-# Loop through all year combos, extract the temperatures at the data locations
+print(
+  nc_open(
+    "/Users/maxlindmark/Dropbox/max-work/R/larvae-sizes/data/covariates/ensemble/thetao_ensemble_sd+ba_surface_depth_5.0_perc_ssp245.nc"))
+
+st_tibble5 <- read_trim_nc("/Users/maxlindmark/Dropbox/max-work/R/larvae-sizes/data/covariates/ensemble/thetao_ensemble_sd+ba_surface_depth_5.0_perc_ssp245.nc")
+
+# Loop through all year/month combos, extract the temperatures at the data locations
 temp_list <- list()
 
-d <- d %>% 
-  mutate(year_q = paste(year, quarter, sep = "_")) 
+for (i in unique(d$year_month)) {
+  d_sub <- filter(d, year_month == i)
+  temp_tibble_sub <- filter(st_tibble5, year_month == i)
 
-d_temp <- d %>% 
-  filter(year_q %in% temp_tibble$year_q)
-
-for(i in unique(d_temp$year_q)) {
-  
-  d_sub <- filter(d_temp, year_q == i)
-  temp_tibble_sub <- filter(temp_tibble, year_q == i)
-  
   # Convert to raster
-  temp_raster <- as_spatraster(temp_tibble_sub, xycols = 2:3,
-                               crs = "WGS84", digits = 2)
-
-  ggplot() +
-    geom_spatraster(data = temp_raster$bottomT, aes(fill = bottomT)) + 
-    scale_fill_viridis(option = "magma") +
-    ggtitle(i)
+  temp_raster <- as_spatraster(temp_tibble_sub,
+    xycols = 3:4,
+    crs = "WGS84", digits = 3
+  )
 
   # Extract from raster
-  d_sub$temp <- terra::extract(temp_raster$bottomT,
-                               d_sub %>% dplyr::select(lon, lat))$bottomT  
-    
+  d_sub$temp <- terra::extract(
+    temp_raster$thetao,
+    d_sub |> dplyr::select(lon, lat)
+  )$thetao
+
   # Save
   temp_list[[i]] <- d_sub
-  
 }
 
 d_temp <- bind_rows(temp_list)
-
-d <- bind_rows(d_temp,
-               d %>% filter(!year_q %in% unique(d_temp$year_q)))
 ```
 
 ### Save
 
 ```{r}
-write_csv(d, paste0(home, "/data/clean/trawl.csv"))
+write_csv(d_temp, paste0(home, "/data/clean/trawl.csv"))
 ```
 
 
