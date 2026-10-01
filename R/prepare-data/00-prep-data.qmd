@@ -75,6 +75,13 @@ depth_box <- getNOAA.bathy(min(d$lon) - .1, max(d$lon) + .1, min(d$lat)  - .1, m
 d$depth <- get.depth(depth_box, x=d$lon, y=d$lat, locator=F)$depth*(-1)
 ```
 
+Remove positive catches deeper than 150 m, outside the species' known depth range. As of 2026 this removes a single haul (2026 Q3 haul 159: ~1 kg/km2 at 249 m; next deepest positive catch is 112 m). On its own it widened the quadratic depth effect and raised the biomass index by ~40% (see R/analysis/rom-test.qmd)
+
+```{r}
+d <- d |>
+  filter(!(density > 0 & depth > 150))
+```
+
 ```{r}
 d %>% 
   filter(year < 2011) |> 

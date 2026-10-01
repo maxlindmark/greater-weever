@@ -50,3 +50,4 @@ rsconnect/
 .positai
 
 /data/covariates/
+.claude/settings.local.json

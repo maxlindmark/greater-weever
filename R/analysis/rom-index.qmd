@@ -59,9 +59,10 @@ d <- readr::read_csv(paste0(home, "/data/clean/trawl.csv")) |>
          year_f = as.factor(year))
 
 # Read prediction grid
-pred_grid <- readr::read_csv(paste0(home, "/data/clean/pred_grid.csv")) |> 
-  drop_na(temp) |> 
-  filter(depth > 0) |> 
+pred_grid <- readr::read_csv(paste0(home, "/data/clean/pred_grid.csv")) |>
+  drop_na(temp) |>
+  # Shallower than this there are no hauls, so predictions are pure extrapolation of the depth effect
+  filter(depth >= 10) |>
   mutate(temp_sc = as.numeric(scale(temp)),
          depth = log(depth),
          depth_sc = (depth - mean(d$depth)) / sd(d$depth),
